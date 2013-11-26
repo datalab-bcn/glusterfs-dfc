@@ -1,0 +1,10 @@
+
+Installation
+============
+
+GlusterFS and gfsys are required to be compiled and installed from sources.
+
+1. ./autogen.sh
+2. ./configure --with-glusterfs=<glusterfs path> --with-gfsys=<gfsys path>
+3. make
+4. make install
