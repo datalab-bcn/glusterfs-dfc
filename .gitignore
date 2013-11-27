@@ -2,6 +2,7 @@ aclocal.m4
 autom4te.cache
 build
 config.*
+dfc-config.h*
 configure
 depcomp
 install-sh

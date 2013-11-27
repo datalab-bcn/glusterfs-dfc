@@ -19,7 +19,7 @@ if libtool --help 2>&1 | grep -q quiet; then
     AM_LIBTOOLFLAGS="$AM_LIBTOOLFLAGS --quiet"
 fi
 
-AC_CONFIG_HEADERS([config.h])
+AC_CONFIG_HEADERS([dfc-config.h])
 
 AC_CONFIG_FILES([Makefile
                  src/Makefile
@@ -59,7 +59,7 @@ AC_ARG_WITH(gfsys,
             [AC_MSG_RESULT([no])
              AC_MSG_ERROR([--with-gfsys is mandatory])])
 if test -d "$gfsys"; then
-    if test -f "$gfsys/config.h"; then
+    if test -f "$gfsys/sys-config.h"; then
         AC_MSG_RESULT([yes])
     else
         AC_MSG_RESULT([no])
