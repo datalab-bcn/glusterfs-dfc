@@ -114,7 +114,7 @@ struct _dfc_manager
 
 int32_t __dump_xdata(dict_t * xdata, char * key, data_t * value, void * data)
 {
-    logI("    %s: %u", key, value->len);
+    logT("    %s: %u", key, value->len);
 
     return 0;
 }
@@ -279,7 +279,7 @@ err_t dfc_sort_unwind(call_frame_t * frame, dfc_sort_t * sort)
         GOTO(failed, &error)
     );
 
-    logI("Sending sort request");
+    logT("Sending sort request");
     dict_foreach(xdata, __dump_xdata, NULL);
 
     SYS_IO(sys_gf_getxattr_unwind, (frame, 0, 0, xdata, NULL), NULL);
@@ -452,11 +452,11 @@ err_t dfc_link_add(xlator_t * xl, dfc_link_t * link, dfc_dependencies_t * deps)
     inode = link->inode;
     LOCK(&inode->lock);
 
-    logD("Adding %ld", link->request->txn);
+    logT("Adding %ld", link->request->txn);
 
     if ((__inode_ctx_get(inode, xl, &value) != 0) || (value == 0))
     {
-        logD("Created context");
+        logT("Created context");
         value = (uint64_t)(uintptr_t)link;
         SYS_CODE(
             __inode_ctx_set, (inode, xl, &value),
@@ -478,14 +478,14 @@ err_t dfc_link_add(xlator_t * xl, dfc_link_t * link, dfc_dependencies_t * deps)
             {
                 if (current->request->txn > link->request->txn)
                 {
-                    logD("Insert first");
+                    logT("Insert first");
                     list_add_tail(&link->client_list, &current->client_list);
                     list_add(&link->inode_list, &current->inode_list);
                     list_del_init(&current->inode_list);
 
                     if (current == first)
                     {
-                        logD("Replace head");
+                        logT("Replace head");
                         value = (uint64_t)(uintptr_t)link;
                         SYS_CODE(
                             __inode_ctx_set, (inode, xl, &value),
@@ -499,7 +499,7 @@ err_t dfc_link_add(xlator_t * xl, dfc_link_t * link, dfc_dependencies_t * deps)
                 }
                 else
                 {
-                    logD("Insert inside");
+                    logT("Insert inside");
                     aux = list_entry(current->client_list.prev, dfc_link_t,
                                      client_list);
                     while (aux->request->txn > link->request->txn)
@@ -512,7 +512,7 @@ err_t dfc_link_add(xlator_t * xl, dfc_link_t * link, dfc_dependencies_t * deps)
                 aux = current;
                 do
                 {
-                    logD("-> %ld", aux->request->txn);
+                    logT("-> %ld", aux->request->txn);
                     aux = list_entry(aux->client_list.next, dfc_link_t,
                                      client_list);
                 } while (aux != current);
@@ -559,7 +559,7 @@ bool dfc_link_entry_allowed(dfc_link_t * link, dfc_link_t * root, uuid_t uuid,
         {
             if (req->txn <= txn)
             {
-                logD("Required transaction not executed yet (inode)");
+                logT("Required transaction not executed yet (inode)");
                 if (req->bad)
                 {
                     logW("Cascading bad request flag");
@@ -581,7 +581,7 @@ bool dfc_link_entry_allowed(dfc_link_t * link, dfc_link_t * root, uuid_t uuid,
     res = (txn < client->next_txn);
     if (!res)
     {
-        logD("Required transaction not executed yet (client)");
+        logT("Required transaction not executed yet (client)");
     }
 
     dfc_client_put(client);
@@ -742,7 +742,7 @@ dfc_request_t * dfc_link_allowed(dfc_link_t * link, dfc_link_t * root)
                 base = ptr;
                 uuid = __sys_buf_ptr_uuid(&ptr);
                 num = __sys_buf_get_int64(&ptr);
-                logD("Evaluating %s:%lu", dfc_uuid(uuid1, *uuid), num);
+                logT("Evaluating %s:%lu", dfc_uuid(uuid1, *uuid), num);
 
                 if (!dfc_link_entry_allowed(link, root, *uuid, num))
                 {
@@ -756,7 +756,7 @@ dfc_request_t * dfc_link_allowed(dfc_link_t * link, dfc_link_t * root)
             } while (size > 0);
         }
 
-        logD("Remaining dependencies: %lu", new_size);
+        logT("Remaining dependencies: %lu", new_size);
 
         req->sort_size = new_size;
         if (new_size == 0)
@@ -769,7 +769,7 @@ dfc_request_t * dfc_link_allowed(dfc_link_t * link, dfc_link_t * root)
         dfc_link_scan(root, link, graph, &index, &cycle);
         if (list_empty(&cycle))
         {
-            logD("Request delayed due to dependencies");
+            logT("Request delayed due to dependencies");
             return NULL;
         }
 
@@ -814,17 +814,17 @@ dfc_request_t * dfc_link_check(dfc_link_t * link, dfc_link_t * root)
         {
             if (req == NULL)
             {
-                logD("Request not allowed");
+                logT("Request not allowed");
             }
             else
             {
-                logD("Another inode has dependencies: %d", req->refs);
+                logT("Another inode has dependencies: %d", req->refs);
             }
         }
     }
     else
     {
-        logD("Request is not ready");
+        logT("Request is not ready");
     }
 
     return NULL;
@@ -840,7 +840,7 @@ SYS_ASYNC_CREATE(dfc_link_del, ((xlator_t *, xl), (dfc_link_t *, link)))
     inode_t * inode;
 
     inode = link->inode;
-    logD("Removing request from inode %p", inode);
+    logT("Removing request from inode %p", inode);
     LOCK(&inode->lock);
 
     SYS_ASSERT(
@@ -883,7 +883,7 @@ SYS_ASYNC_CREATE(dfc_link_del, ((xlator_t *, xl), (dfc_link_t *, link)))
 
     if (req != NULL)
     {
-        logD("Dispatching request %ld after request %ld", req->txn,
+        logT("Dispatching request %ld after request %ld", req->txn,
              link->request->txn);
         dfc_request_execute(req);
     }
@@ -895,7 +895,7 @@ SYS_ASYNC_CREATE(dfc_link_execute, ((dfc_link_t *, link)))
     dfc_request_t * req = NULL;
     uint64_t value;
 
-    logD("Evaluating order of execution on inode %p", link->inode);
+    logT("Evaluating order of execution on inode %p", link->inode);
 
     LOCK(&link->inode->lock);
 
@@ -918,7 +918,7 @@ SYS_ASYNC_CREATE(dfc_link_execute, ((dfc_link_t *, link)))
     }
     else
     {
-        logD("Request %ld cannot be executed yet on inode %p",
+        logT("Request %ld cannot be executed yet on inode %p",
              link->request->txn, link->inode);
     }
 }
@@ -947,7 +947,7 @@ SYS_CBK_CREATE(dfc_request_complete, data, ((dfc_request_t *, req)))
 
 void dfc_request_execute(dfc_request_t * req)
 {
-    logD("Dispatching request %ld", req->txn);
+    logT("Dispatching request %ld", req->txn);
     if (!req->bad)
     {
         sys_gf_wind(req->frame, NULL, FIRST_CHILD(req->xl),
@@ -956,7 +956,7 @@ void dfc_request_execute(dfc_request_t * req)
     }
     else
     {
-        logD("Request is bad");
+        logT("Request is bad");
         sys_gf_unwind_error(req->frame, EIO, NULL, NULL, NULL,
                             (uintptr_t *)req, (uintptr_t *)req + DFC_REQ_SIZE);
 
@@ -978,7 +978,7 @@ err_t dfc_request_dependencies(dfc_request_t * req, dfc_dependencies_t * deps)
 
     if (req->link1.inode != NULL)
     {
-        logD("Checking inode1 dependencies");
+        logT("Checking inode1 dependencies");
         SYS_CALL(
             dfc_link_add, (req->xl, &req->link1, deps),
             E(),
@@ -987,7 +987,7 @@ err_t dfc_request_dependencies(dfc_request_t * req, dfc_dependencies_t * deps)
     }
     if (req->link2.inode != NULL)
     {
-        logD("Checking inode2 dependencies");
+        logT("Checking inode2 dependencies");
         dfc_dependency_initialize(&deps_aux, 0);
         SYS_CALL(
             dfc_link_add, (req->xl, &req->link2, &deps_aux),
@@ -1025,19 +1025,19 @@ void dfc_dependency_dump(dfc_request_t * req, dfc_dependencies_t * deps)
     ptr = deps->buffer;
     if (ptr != deps->head)
     {
-        logI("Request %s:%lu depends on:",
+        logT("Request %s:%lu depends on:",
              dfc_uuid(uuid1, req->client->uuid), req->txn);
 
         while (ptr != deps->head)
         {
             uuid = __sys_buf_ptr_uuid(&ptr);
             num = __sys_buf_get_int64(&ptr);
-            logI("    %s:%lu", dfc_uuid(uuid1, *uuid), num);
+            logT("    %s:%lu", dfc_uuid(uuid1, *uuid), num);
         }
     }
     else
     {
-        logI("Request %s:%lu does not have dependencies",
+        logT("Request %s:%lu does not have dependencies",
              dfc_uuid(uuid1, req->client->uuid), req->txn);
     }
 }
@@ -1099,7 +1099,7 @@ err_t dfc_sort_parse(dfc_client_t * client, void * sort, size_t size)
     size_t bsize;
     uint32_t length;
 
-    logD("Parsing sort data: %lu", size);
+    logT("Parsing sort data: %lu", size);
 
     ptr = sort;
     while (size > 0)
@@ -1138,11 +1138,11 @@ err_t dfc_sort_parse(dfc_client_t * client, void * sort, size_t size)
             req->bad = true;
         }
 
-        logD("Processed txn = %lu, received_txn = %lu",
+        logT("Processed txn = %lu, received_txn = %lu",
              txn, client->received_txn);
         while (client->received_txn == txn)
         {
-            logI("Going to execute transaction %lu", txn);
+            logT("Going to execute transaction %lu", txn);
 
             *preq = req->next;
 
@@ -1224,7 +1224,7 @@ SYS_LOCK_CREATE(dfc_sort_client_add, ((dfc_request_t *, req)))
 
     client = req->client;
 
-    logD("Processing request dependencies");
+    logT("Processing request dependencies");
 
     SYS_CALL(
         dfc_dependency_build, (&deps, req),
@@ -1354,7 +1354,7 @@ err_t dfc_analyze(dfc_manager_t * dfc, dict_t ** xdata, uuid_t uuid,
         memcpy(*sort, data, length);
     }
 
-    logI("Request from %s: %ld, %lu", dfc_uuid(uuid1, uuid), *txn,
+    logT("Request from %s: %ld, %lu", dfc_uuid(uuid1, uuid), *txn,
          (mask & 4) ? length : 0);
 
     return 0;
@@ -1366,7 +1366,7 @@ SYS_DELAY_DEFINE(dfc_sort_client_process, ((dfc_request_t *, req)))
 
     req->ready = true;
 
-    logD("Executing request %lu", req->txn);
+    logT("Executing request %lu", req->txn);
 
     deps = false;
     if (req->link1.inode != NULL)
@@ -1563,7 +1563,7 @@ DFC_MANAGE(fxattrop,     false, fd->inode,      NULL)
         uuid_t uuid; \
         int64_t txn; \
         dfc_manager_t * dfc = xl->private; \
-        logI("DFC(" #_fop ")"); \
+        logT("DFC(" #_fop ")"); \
         err_t error = dfc_analyze(dfc, &xdata, uuid, &txn, \
                                   NULL, NULL); \
         if (error == ENOENT) \
@@ -1574,7 +1574,7 @@ DFC_MANAGE(fxattrop,     false, fd->inode,      NULL)
         } \
         if (error == 0) \
         { \
-            logI("DFC(" #_fop ") managed"); \
+            logT("DFC(" #_fop ") managed"); \
             SYS_ASYNC( \
                 dfc_managed_##_fop, (dfc, frame, xl, uuid, txn, \
                                      SYS_ARGS_NAMES((SYS_GF_ARGS_##_fop))) \
@@ -1593,7 +1593,7 @@ static int32_t dfc_lookup(call_frame_t * frame, xlator_t * xl,
     size_t size;
     dfc_manager_t * dfc = xl->private;
     void * sort = NULL;
-    logI("DFC(lookup)");
+    logT("DFC(lookup)");
     err_t error = dfc_analyze(dfc, &xdata, uuid, &txn, &sort, &size);
 
     if (error == ENOENT)
@@ -1606,7 +1606,7 @@ static int32_t dfc_lookup(call_frame_t * frame, xlator_t * xl,
     {
         if (sort == NULL)
         {
-            logI("DFC(lookup) managed");
+            logT("DFC(lookup) managed");
             SYS_ASYNC(
                 dfc_managed_lookup, (dfc, frame, xl, uuid, txn,
                                      SYS_ARGS_NAMES((SYS_GF_ARGS_lookup)))
@@ -1615,7 +1615,7 @@ static int32_t dfc_lookup(call_frame_t * frame, xlator_t * xl,
         }
         if ((loc->name == NULL) && (strcmp(loc->path, "/") == 0))
         {
-            logI("DFC(lookup) init");
+            logT("DFC(lookup) init");
             SYS_FREE(sort);
             SYS_ASYNC(
                 dfc_init_handler, (dfc, frame, xl, uuid, txn,
@@ -1638,7 +1638,7 @@ static int32_t dfc_getxattr(call_frame_t * frame, xlator_t * xl,
     size_t size;
     dfc_manager_t * dfc = xl->private;
     void * sort = NULL;
-    logI("DFC(getxattr)");
+    logT("DFC(getxattr)");
     dict_foreach(xdata, __dump_xdata, NULL);
     err_t error = dfc_analyze(dfc, &xdata, uuid, &txn, &sort, &size);
 
@@ -1652,7 +1652,7 @@ static int32_t dfc_getxattr(call_frame_t * frame, xlator_t * xl,
     {
         if (sort == NULL)
         {
-            logI("DFC(getxattr) managed");
+            logT("DFC(getxattr) managed");
             SYS_ASYNC(
                 dfc_managed_getxattr, (dfc, frame, xl, uuid, txn,
                                        SYS_ARGS_NAMES((SYS_GF_ARGS_getxattr)))
@@ -1661,7 +1661,7 @@ static int32_t dfc_getxattr(call_frame_t * frame, xlator_t * xl,
         }
         if ((loc->name == NULL) && (strcmp(loc->path, "/") == 0))
         {
-            logI("DFC(getxattr) sort");
+            logT("DFC(getxattr) sort");
             SYS_ASYNC(dfc_sort_handler, (dfc, frame, xl, uuid, txn, sort,
                                          size));
             return 0;

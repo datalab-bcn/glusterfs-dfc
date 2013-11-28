@@ -98,7 +98,7 @@ struct _dfc
 
 int32_t __xdata_dump(dict_t * xdata, char * key, data_t * value, void * data)
 {
-    logI("    %s: %u", key, value->len);
+    logT("    %s: %u", key, value->len);
 
     return 0;
 }
@@ -463,7 +463,7 @@ void dfc_dump(char * text, uint8_t * data, size_t size)
                 buf[57 + i] = '.';
             }
         }
-        logD("%s", buf);
+        logT("%s", buf);
     } while (size > 0);
 }
 
@@ -503,7 +503,7 @@ SYS_CBK_CREATE(dfc_sort_recv, data, ((dfc_t *, dfc), (dfc_request_t *, req)))
     atomic_dec(&req->child->active, memory_order_seq_cst);
 
     args = (SYS_GF_CBK_CALL_TYPE(getxattr) *)data;
-    logI("Processing sort request:");
+    logT("Processing sort request:");
     dict_foreach(args->dict, __xdata_dump, NULL);
 
     sort = &req->sort;
@@ -555,7 +555,7 @@ err_t __dfc_sort_send(dfc_child_t * child, dfc_sort_t * sort)
         GOTO(failed, &error)
     );
 
-    logI("getxattr xdata = %p", xdata);
+    logT("getxattr xdata = %p", xdata);
     dict_foreach(xdata, __xdata_dump, NULL);
     atomic_inc(&child->active, memory_order_seq_cst);
     SYS_IO(sys_gf_getxattr_wind, (req->frame, NULL, child->xl,
