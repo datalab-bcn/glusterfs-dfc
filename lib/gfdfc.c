@@ -742,7 +742,7 @@ err_t dfc_create(xlator_t * xl, uint32_t max_requests, uint32_t requests,
     tmp->max_requests = max_requests;
     tmp->requests = requests;
     INIT_LIST_HEAD(&tmp->children);
-    memcpy(tmp->uuid, xl->ctx->process_uuid, sizeof(tmp->uuid));
+    uuid_generate(tmp->uuid);
 
     tmp->txns = NULL;
     SYS_CALLOC(
