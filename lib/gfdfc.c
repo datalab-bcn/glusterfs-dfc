@@ -98,7 +98,7 @@ struct _dfc
 
 int32_t __xdata_dump(dict_t * xdata, char * key, data_t * value, void * data)
 {
-    logT("    %s: %u", key, value->len);
+    logI("    %s: %u", key, value->len);
 
     return 0;
 }
@@ -107,6 +107,7 @@ void dfc_sort_initialize(dfc_sort_t * sort)
 {
     sort->head = sort->data;
     sort->size = sizeof(sort->data);
+    sort->pending = true;
 }
 
 void dfc_sort_destroy(dfc_sort_t * sort)
@@ -343,7 +344,7 @@ err_t dfc_sort_process_one(dfc_t * dfc, dfc_child_t * child, void * data,
         RETERR()
     );
 
-    logD("Processing txn %lu", num);
+//    logI("Sort request for txn %lu", num);
 
     id = num & dfc->txn_mask;
 
@@ -411,10 +412,11 @@ found:
 failed_lock:
     sys_mutex_unlock(&txn->lock);
 
-    logD("Transaction %lu is ready (%d)", num, txn->state);
+//    logD("Transaction %lu is ready (%d)", num, txn->state);
 
     if ((atomic_dec(&txn->state, memory_order_seq_cst) & 0xFFFF) == 1)
     {
+//        logI("Sending sort info for %ld", num);
         dfc_request_send(txn->dfc, txn->mask, txn->sort.data,
                          sizeof(txn->sort.data) - txn->sort.size);
     }
@@ -434,6 +436,7 @@ void dfc_dump(char * text, uint8_t * data, size_t size)
         return;
     }
 
+    logI("%s:", text);
     buf[4] = ' ';
     buf[5] = '|';
     buf[54] = ' ';
@@ -447,6 +450,7 @@ void dfc_dump(char * text, uint8_t * data, size_t size)
         buf[1] = dfc_hex[(off >> 16) & 15];
         buf[2] = dfc_hex[(off >> 8) & 15];
         buf[3] = dfc_hex[off & 15];
+        off += 16;
         for (i = 0; i < 16; i++)
         {
             if (size > 0)
@@ -463,7 +467,7 @@ void dfc_dump(char * text, uint8_t * data, size_t size)
                 buf[57 + i] = '.';
             }
         }
-        logT("%s", buf);
+        logI("   %s", buf);
     } while (size > 0);
 }
 
@@ -472,7 +476,7 @@ err_t dfc_sort_process(dfc_t * dfc, dfc_child_t * child, dfc_sort_t * sort)
     void * data;
     uint32_t length;
 
-    dfc_dump("sort data", sort->head, sort->size);
+//    dfc_dump("Recv", sort->head, sort->size);
 
     while (sort->size > 0)
     {
@@ -503,8 +507,11 @@ SYS_CBK_CREATE(dfc_sort_recv, data, ((dfc_t *, dfc), (dfc_request_t *, req)))
     atomic_dec(&req->child->active, memory_order_seq_cst);
 
     args = (SYS_GF_CBK_CALL_TYPE(getxattr) *)data;
-    logT("Processing sort request:");
-    dict_foreach(args->dict, __xdata_dump, NULL);
+//    logT("Processing sort request:");
+//    if (args->dict != NULL)
+//    {
+//        dict_foreach(args->dict, __xdata_dump, NULL);
+//    }
 
     sort = &req->sort;
     sort->head = sort->data;
@@ -512,7 +519,7 @@ SYS_CBK_CREATE(dfc_sort_recv, data, ((dfc_t *, dfc), (dfc_request_t *, req)))
     SYS_CALL(
         sys_dict_get_bin, (args->dict, DFC_XATTR_SORT, sort->data,
                            &sort->size),
-        E(),
+        T(),
         GOTO(done)
     );
 
@@ -555,9 +562,10 @@ err_t __dfc_sort_send(dfc_child_t * child, dfc_sort_t * sort)
         GOTO(failed, &error)
     );
 
-    logT("getxattr xdata = %p", xdata);
-    dict_foreach(xdata, __xdata_dump, NULL);
+//    logI("getxattr xdata = %p", xdata);
+//    dict_foreach(xdata, __xdata_dump, NULL);
     atomic_inc(&child->active, memory_order_seq_cst);
+//    dfc_dump("Send", sort->data, sizeof(sort->data) - sort->size);
     SYS_IO(sys_gf_getxattr_wind, (req->frame, NULL, child->xl,
                                   &child->dfc->root_loc, DFC_XATTR_SORT,
                                   xdata),
@@ -576,7 +584,7 @@ SYS_LOCK_CREATE(dfc_sort_send, ((dfc_child_t *, child), (dfc_sort_t *, sort)))
     SYS_CALL(
         __dfc_sort_send, (child, sort),
         E(),
-        RETURN()
+        GOTO(failed)
     );
 
     if (child->sort == sort)
@@ -588,10 +596,12 @@ SYS_LOCK_CREATE(dfc_sort_send, ((dfc_child_t *, child), (dfc_sort_t *, sort)))
         SYS_FREE(sort);
     }
 
+failed:
     SYS_UNLOCK(&child->lock);
 }
 
-void dfc_sort_add(dfc_child_t * child, void * data, size_t size)
+SYS_LOCK_CREATE(dfc_sort_add, ((dfc_child_t *, child), (void *, data),
+                               (size_t, size)))
 {
     dfc_sort_t * sort;
     err_t error = ENOBUFS;
@@ -611,7 +621,7 @@ void dfc_sort_add(dfc_child_t * child, void * data, size_t size)
             dfc_sort_create, (&sort),
             E(),
             LOG(E(), "Cannot allocate buffers for DFC sort."),
-            RETURN()
+            GOTO(failed)
         );
 
         child->sort = sort;
@@ -620,11 +630,18 @@ void dfc_sort_add(dfc_child_t * child, void * data, size_t size)
             sys_buf_set_block, (&sort->head, &sort->size, data, size),
             E(),
             LOG(E(), "Cannot store data into DFC sort buffers."),
-            RETURN()
+            GOTO(failed)
         );
     }
 
-    SYS_LOCK(&child->lock, INT64_MAX, dfc_sort_send, (child, sort));
+    if (sort->pending)
+    {
+        sort->pending = false;
+        SYS_LOCK(&child->lock, INT64_MAX, dfc_sort_send, (child, sort));
+    }
+
+failed:
+    SYS_UNLOCK(&child->lock);
 }
 
 void dfc_request_send(dfc_t * dfc, uint64_t mask, void * data, size_t size)
@@ -637,7 +654,8 @@ void dfc_request_send(dfc_t * dfc, uint64_t mask, void * data, size_t size)
     {
         if ((mask & 1) != 0)
         {
-            dfc_sort_add(child, data, size);
+            SYS_LOCK(&child->lock, INT64_MAX,
+                     dfc_sort_add, (child, data, size));
         }
 
         mask >>= 1;

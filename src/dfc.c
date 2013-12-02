@@ -266,6 +266,53 @@ err_t dfc_sort_create(dfc_client_t * client)
     return 0;
 }
 
+static char dfc_hex[] = "0123456789ABCDEF";
+
+void dfc_dump(char * text, uint8_t * data, size_t size)
+{
+    uint32_t off, i;
+    char buf[80];
+
+    if (size == 0)
+    {
+        return;
+    }
+
+    logI("%s:", text);
+    buf[4] = ' ';
+    buf[5] = '|';
+    buf[54] = ' ';
+    buf[55] = '|';
+    buf[56] = ' ';
+    buf[73] = 0;
+    off = 0;
+    do
+    {
+        buf[0] = dfc_hex[off >> 24];
+        buf[1] = dfc_hex[(off >> 16) & 15];
+        buf[2] = dfc_hex[(off >> 8) & 15];
+        buf[3] = dfc_hex[off & 15];
+        off += 16;
+        for (i = 0; i < 16; i++)
+        {
+            if (size > 0)
+            {
+                size--;
+                buf[6 + i * 3] = ' ';
+                buf[7 + i * 3] = dfc_hex[*data >> 4];
+                buf[8 + i * 3] = dfc_hex[*data & 15];
+                buf[57 + i] = *data++;
+            }
+            else
+            {
+                buf[6 + i * 3] = buf[7 + i * 3] = buf[8 + i * 3] = ' ';
+                buf[57 + i] = '.';
+            }
+        }
+        logI("   %s", buf);
+    } while (size > 0);
+}
+
 err_t dfc_sort_unwind(call_frame_t * frame, dfc_sort_t * sort)
 {
     dict_t * xdata;
@@ -279,8 +326,9 @@ err_t dfc_sort_unwind(call_frame_t * frame, dfc_sort_t * sort)
         GOTO(failed, &error)
     );
 
-    logT("Sending sort request");
-    dict_foreach(xdata, __dump_xdata, NULL);
+//    logI("Sending sort request");
+//    dict_foreach(xdata, __dump_xdata, NULL);
+//    dfc_dump("Send", sort->data, sizeof(sort->data) - sort->size);
 
     SYS_IO(sys_gf_getxattr_unwind, (frame, 0, 0, xdata, NULL), NULL);
 
@@ -331,6 +379,8 @@ SYS_LOCK_CREATE(dfc_sort_client_send, ((dfc_client_t *, client),
     }
 
 failed:
+    logW("No sort requests available to send info");
+
     list_add_tail(&sort->list, &client->sort_pending);
 
     SYS_UNLOCK(&client->lock);
@@ -831,10 +881,12 @@ dfc_request_t * dfc_link_check(dfc_link_t * link, dfc_link_t * root)
 }
 
 void dfc_request_execute(dfc_request_t * req);
+SYS_LOCK_DECLARE(dfc_serialize, ((dfc_client_t *, client), (int64_t, txn)));
 
 SYS_ASYNC_CREATE(dfc_link_del, ((xlator_t *, xl), (dfc_link_t *, link)))
 {
     dfc_link_t * root, * tmp;
+    dfc_client_t * client;
     dfc_request_t * req = NULL;
     uint64_t value;
     inode_t * inode;
@@ -887,6 +939,12 @@ SYS_ASYNC_CREATE(dfc_link_del, ((xlator_t *, xl), (dfc_link_t *, link)))
              link->request->txn);
         dfc_request_execute(req);
     }
+    else
+    {
+        client = link->request->client;
+        SYS_LOCK(&client->lock, INT64_MAX,
+                 dfc_serialize, (client, link->request->txn + 1));
+    }
 }
 
 SYS_ASYNC_CREATE(dfc_link_execute, ((dfc_link_t *, link)))
@@ -909,6 +967,12 @@ SYS_ASYNC_CREATE(dfc_link_execute, ((dfc_link_t *, link)))
     {
         req = dfc_link_check(link, root);
     }
+    else
+    {
+//        logI("Request is not first: root=%p (%lu), link=%p (%lu), %u", root,
+//             root->request->txn, link, link->request->txn,
+//             list_empty(&link->inode_list));
+    }
 
     UNLOCK(&link->inode->lock);
 
@@ -918,8 +982,8 @@ SYS_ASYNC_CREATE(dfc_link_execute, ((dfc_link_t *, link)))
     }
     else
     {
-        logT("Request %ld cannot be executed yet on inode %p",
-             link->request->txn, link->inode);
+//        logI("Request %ld cannot be executed yet on inode %p",
+//             link->request->txn, link->inode);
     }
 }
 
@@ -932,6 +996,8 @@ SYS_CBK_CREATE(dfc_request_complete, data, ((dfc_request_t *, req)))
         "Current request does not correspond to the next transaction: "
         "%ld, %ld", req->txn, req->client->next_txn
     );
+
+//    logI("Completed request %ld", req->txn);
 
     atomic_inc(&req->client->next_txn, memory_order_seq_cst);
 
@@ -947,7 +1013,7 @@ SYS_CBK_CREATE(dfc_request_complete, data, ((dfc_request_t *, req)))
 
 void dfc_request_execute(dfc_request_t * req)
 {
-    logT("Dispatching request %ld", req->txn);
+//    logI("Dispatching request %ld", req->txn);
     if (!req->bad)
     {
         sys_gf_wind(req->frame, NULL, FIRST_CHILD(req->xl),
@@ -1089,17 +1155,65 @@ err_t dfc_request_prepare(dfc_manager_t * dfc, dfc_request_t * req,
     return 0;
 }
 
-SYS_DELAY_DECLARE(dfc_sort_client_process, ((dfc_request_t *, req)));
+void dfc_sort_client_process(dfc_request_t * req);
+
+void __dfc_serialize(dfc_client_t * client, int64_t txn)
+{
+    dfc_request_t * req, ** preq;
+    dfc_sort_t * sort;
+
+//    logI("Processed txn = %lu, received_txn = %lu",
+//         txn, client->received_txn);
+    while (client->received_txn == txn)
+    {
+        preq = &client->requests[txn & client->txn_mask];
+        req = *preq;
+        while ((req != NULL) && (req->txn != txn))
+        {
+            preq = &req->next;
+            req = *preq;
+        }
+        if ((req == NULL) || !req->ready)
+        {
+            break;
+        }
+
+//        logI("Going to execute transaction %lu", txn);
+
+        *preq = req->next;
+
+        client->received_txn++;
+        sort = req->sort;
+        if (!sys_delay_cancel(req->delay, false))
+        {
+            SYS_FREE(sort);
+        }
+        else
+        {
+            dfc_sort_client_process(req);
+        }
+        txn++;
+    }
+}
+
+SYS_LOCK_DEFINE(dfc_serialize, ((dfc_client_t *, client), (int64_t, txn)))
+{
+    __dfc_serialize(client, txn);
+
+    SYS_UNLOCK(&client->lock);
+}
 
 err_t dfc_sort_parse(dfc_client_t * client, void * sort, size_t size)
 {
-    dfc_request_t * req, ** preq;
-    void * ptr, * data, * tmp;
+    dfc_request_t * req;
+    void * ptr, * data;
     int64_t txn;
     size_t bsize;
     uint32_t length;
 
     logT("Parsing sort data: %lu", size);
+
+//    dfc_dump("Recv", sort, size);
 
     ptr = sort;
     while (size > 0)
@@ -1117,12 +1231,12 @@ err_t dfc_sort_parse(dfc_client_t * client, void * sort, size_t size)
             CONTINUE()
         );
 
-        preq = &client->requests[txn & client->txn_mask];
-        req = *preq;
+//        logI("Sort info for txn %ld", txn);
+
+        req = client->requests[txn & client->txn_mask];
         while ((req != NULL) && (req->txn != txn))
         {
-            preq = &req->next;
-            req = *preq;
+            req = req->next;
         }
         SYS_TEST(
             req != NULL,
@@ -1138,35 +1252,9 @@ err_t dfc_sort_parse(dfc_client_t * client, void * sort, size_t size)
             req->bad = true;
         }
 
-        logT("Processed txn = %lu, received_txn = %lu",
-             txn, client->received_txn);
-        while (client->received_txn == txn)
-        {
-            logT("Going to execute transaction %lu", txn);
+        req->ready = true;
 
-            *preq = req->next;
-
-            client->received_txn++;
-            tmp = req->sort;
-            if (!sys_delay_cancel(req->delay, false))
-            {
-                SYS_FREE(tmp);
-            }
-            else
-            {
-                dfc_sort_client_process(req);
-            }
-            txn++;
-            req = client->requests[txn & client->txn_mask];
-            while ((req != NULL) && (req->txn != txn))
-            {
-                req = req->next;
-            }
-            if (req == NULL)
-            {
-                break;
-            }
-        }
+        __dfc_serialize(client, txn);
     }
 
     SYS_FREE(sort);
@@ -1224,7 +1312,7 @@ SYS_LOCK_CREATE(dfc_sort_client_add, ((dfc_request_t *, req)))
 
     client = req->client;
 
-    logT("Processing request dependencies");
+//    logI("Preparing sort request for txn %ld", req->txn);
 
     SYS_CALL(
         dfc_dependency_build, (&deps, req),
@@ -1360,22 +1448,22 @@ err_t dfc_analyze(dfc_manager_t * dfc, dict_t ** xdata, uuid_t uuid,
     return 0;
 }
 
-SYS_DELAY_DEFINE(dfc_sort_client_process, ((dfc_request_t *, req)))
+void dfc_sort_client_process(dfc_request_t * req)
 {
     bool deps;
 
-    req->ready = true;
-
-    logT("Executing request %lu", req->txn);
+//    logI("Executing request %lu", req->txn);
 
     deps = false;
     if (req->link1.inode != NULL)
     {
+//        logI("Executing %lu on inode1", req->txn);
         dfc_link_execute(&req->link1);
         deps = true;
     }
     if (req->link2.inode != NULL)
     {
+//        logI("Executing %lu on inode2", req->txn);
         dfc_link_execute(&req->link2);
         deps = true;
     }
@@ -1384,6 +1472,15 @@ SYS_DELAY_DEFINE(dfc_sort_client_process, ((dfc_request_t *, req)))
     {
         dfc_request_execute(req);
     }
+}
+
+SYS_DELAY_CREATE(dfc_sort_client_process_timeout, ((dfc_request_t *, req)))
+{
+    logW("Request %lu timed out", req->txn);
+
+    req->ready = true;
+
+    dfc_sort_client_process(req);
 }
 
 SYS_LOCK_CREATE(dfc_managed, ((dfc_manager_t *, dfc), (dfc_request_t *, req),
@@ -1413,7 +1510,9 @@ SYS_LOCK_CREATE(dfc_managed, ((dfc_manager_t *, dfc), (dfc_request_t *, req),
     req->sort = NULL;
     req->sort_size = -1;
 
-    req->delay = SYS_DELAY(2000, dfc_sort_client_process, (req), 2);
+//    logI("Managing txn %ld", req->txn);
+
+    req->delay = SYS_DELAY(2000, dfc_sort_client_process_timeout, (req), 2);
     SYS_LOCK(&client->lock, INT64_MAX, dfc_sort_client_add, (req));
 
     SYS_UNLOCK(&dfc->lock);
@@ -1477,6 +1576,7 @@ SYS_ASYNC_CREATE(dfc_sort_handler, ((dfc_manager_t *, dfc),
 {
     dfc_client_t * client;
 
+//    logI("Handling %p", frame);
     SYS_CALL(
         dfc_client_get, (dfc, uuid, &client),
         E(),
@@ -1662,6 +1762,7 @@ static int32_t dfc_getxattr(call_frame_t * frame, xlator_t * xl,
         if ((loc->name == NULL) && (strcmp(loc->path, "/") == 0))
         {
             logT("DFC(getxattr) sort");
+//            logI("Going to handle %p", frame);
             SYS_ASYNC(dfc_sort_handler, (dfc, frame, xl, uuid, txn, sort,
                                          size));
             return 0;
