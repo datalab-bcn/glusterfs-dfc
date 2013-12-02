@@ -49,6 +49,7 @@ failed:
     { \
         if (dfc_complete(txn)); \
         { \
+            logT("DFC(" #_fop "_cbk): %ld", txn->id); \
             sys_gf_handler_call_##_fop##_unwind(NULL, 0, 0, NULL, NULL, io); \
         } \
     } \
@@ -64,6 +65,7 @@ failed:
             E(), \
             GOTO(failed) \
         ); \
+        logT("DFC(" #_fop "): %ld", txn->id); \
         num_childs = 0; \
         for (list = xl->children; list != NULL; list = list->next) \
         { \
@@ -80,7 +82,6 @@ failed:
     static int32_t dfc_test_##_fop(call_frame_t * frame, xlator_t * xl, \
                                    SYS_ARGS_DECL((SYS_GF_ARGS_##_fop))) \
     { \
-        logI("DFC(" #_fop ")"); \
         SYS_ASYNC(__dfc_test_##_fop, (frame, xl, \
                                       SYS_ARGS_NAMES((SYS_GF_ARGS_##_fop)))); \
         return 0; \
@@ -218,7 +219,7 @@ failed:
 static int32_t dfc_test_lookup(call_frame_t * frame, xlator_t * xl,
                                loc_t * loc, dict_t * xdata)
 {
-    logI("DFC(lookup)");
+    logT("DFC(lookup)");
     SYS_ASYNC(__dfc_test_lookup, (frame, xl, loc, xdata));
     return 0;
 }
