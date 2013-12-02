@@ -284,13 +284,50 @@ static int32_t dfc_test_releasedir(xlator_t * xl, fd_t * fd)
     return 0;
 }
 
+static int32_t child_count;
+static int32_t child_up;
+
+int32_t notify(xlator_t * this, int32_t event, void * data, ...)
+{
+    switch (event)
+    {
+        case GF_EVENT_CHILD_UP:
+            if (atomic_inc(&child_up, memory_order_seq_cst) == child_count - 1)
+            {
+                logI("DFC test is UP");
+                return default_notify(this, event, data);
+            }
+            break;
+        case GF_EVENT_CHILD_DOWN:
+            if (atomic_dec(&child_up, memory_order_seq_cst) == child_count)
+            {
+                logI("DFC test is DOWN");
+                return default_notify(this, event, data);
+            }
+            break;
+        default:
+            return default_notify(this, event, data);
+    }
+
+    return 0;
+}
+
 int32_t init(xlator_t * xl)
 {
+    xlator_list_t * list;
+
     SYS_CALL(
         gfsys_initialize, (NULL, false),
         E(),
         RETVAL(-1)
     );
+
+    child_up = 0;
+    child_count = 0;
+    for (list = xl->children; list != NULL; list = list->next)
+    {
+        child_count++;
+    }
 
     return 0;
 }
