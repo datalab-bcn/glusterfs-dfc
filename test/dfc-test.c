@@ -49,7 +49,6 @@ failed:
     { \
         if (dfc_complete(txn)); \
         { \
-            logT("DFC(" #_fop "_cbk): %ld", txn->id); \
             sys_gf_handler_call_##_fop##_unwind(NULL, 0, 0, NULL, NULL, io); \
         } \
     } \
@@ -65,7 +64,6 @@ failed:
             E(), \
             GOTO(failed) \
         ); \
-        logT("DFC(" #_fop "): %ld", txn->id); \
         num_childs = 0; \
         for (list = xl->children; list != NULL; list = list->next) \
         { \
@@ -82,6 +80,7 @@ failed:
     static int32_t dfc_test_##_fop(call_frame_t * frame, xlator_t * xl, \
                                    SYS_ARGS_DECL((SYS_GF_ARGS_##_fop))) \
     { \
+        logT("DFC(" #_fop ")"); \
         SYS_ASYNC(__dfc_test_##_fop, (frame, xl, \
                                       SYS_ARGS_NAMES((SYS_GF_ARGS_##_fop)))); \
         return 0; \
