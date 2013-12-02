@@ -47,7 +47,7 @@ failed:
 #define DFC_TEST_FOP(_fop) \
     SYS_CBK_CREATE(__dfc_test_##_fop##_cbk, io, ((dfc_transaction_t *, txn))) \
     { \
-        if (dfc_complete(txn)); \
+        if (dfc_complete(txn)) \
         { \
             sys_gf_handler_call_##_fop##_unwind(NULL, 0, 0, NULL, NULL, io); \
         } \
