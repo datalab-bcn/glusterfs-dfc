@@ -45,6 +45,7 @@ struct _dfc_sort
 {
     void *  head;
     size_t  size;
+    bool    pending;
     uint8_t data[4096];
 };
 
