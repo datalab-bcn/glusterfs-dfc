@@ -306,8 +306,7 @@ err_t dfc_sort_update(dfc_t * dfc, dfc_sort_t * sort, uuid_t uuid, int64_t txn)
 
         if (uuid_compare(uuid, *client) == 0)
         {
-            if ((uuid_compare(uuid, dfc->uuid) < 0) ^
-                (current > txn))
+            if ((uuid_compare(uuid, dfc->uuid) < 0) ^ (current > txn))
             {
                 __sys_buf_set_int64(&aux, txn);
             }
