@@ -407,7 +407,7 @@ SYS_DELAY_CREATE(dfc_sort_client_retry, ((void, data, CALLS)))
     dfc_request_t * req;
 
     req = (dfc_request_t *)(data - DFC_REQ_SIZE);
-    SYS_LOCK(&req->client->lock, INT64_MAX, __dfc_sort_client_retry, (req));
+    SYS_LOCK(&req->client->lock, __dfc_sort_client_retry, (req));
 
     SYS_IO(sys_gf_getxattr_unwind, (req->frame, 0, 0, NULL, NULL), NULL);
 }
@@ -942,7 +942,7 @@ SYS_ASYNC_CREATE(dfc_link_del, ((xlator_t *, xl), (dfc_link_t *, link)))
     else
     {
         client = link->request->client;
-        SYS_LOCK(&client->lock, INT64_MAX,
+        SYS_LOCK(&client->lock,
                  dfc_serialize, (client, link->request->txn + 1));
     }
 }
@@ -1348,8 +1348,7 @@ SYS_LOCK_CREATE(dfc_sort_client_add, ((dfc_request_t *, req)))
     {
         sort->pending = false;
         // Delay send to allow other requests to be accumulated.
-        SYS_LOCK(&client->lock, INT64_MAX, dfc_sort_client_send, (client,
-                                                                  sort));
+        SYS_LOCK(&client->lock, dfc_sort_client_send, (client, sort));
     }
 
     req->next = client->requests[req->txn & client->txn_mask];
@@ -1513,7 +1512,7 @@ SYS_LOCK_CREATE(dfc_managed, ((dfc_manager_t *, dfc), (dfc_request_t *, req),
 //    logI("Managing txn %ld", req->txn);
 
     req->delay = SYS_DELAY(2000, dfc_sort_client_process_timeout, (req), 2);
-    SYS_LOCK(&client->lock, INT64_MAX, dfc_sort_client_add, (req));
+    SYS_LOCK(&client->lock, dfc_sort_client_add, (req));
 
     SYS_UNLOCK(&dfc->lock);
 
@@ -1563,7 +1562,7 @@ SYS_ASYNC_CREATE(dfc_init_handler, ((dfc_manager_t *, dfc),
                                     SYS_GF_ARGS_lookup))
 {
     uintptr_t * data = SYS_GF_FOP(lookup);
-    SYS_LOCK(&dfc->lock, INT64_MAX,
+    SYS_LOCK(&dfc->lock,
              __dfc_init_handler, (dfc, frame, xl, uuid, txn, data));
 }
 
@@ -1583,7 +1582,7 @@ SYS_ASYNC_CREATE(dfc_sort_handler, ((dfc_manager_t *, dfc),
         GOTO(failed)
     );
 
-    SYS_LOCK(&client->lock, INT64_MAX,
+    SYS_LOCK(&client->lock, 
              dfc_sort_client_recv, (client, frame, txn, sort, size));
 
     return;
@@ -1610,7 +1609,7 @@ failed:
         req->link1.inode = _inode1; \
         req->link2.inode = _inode2; \
         req->refs = ((_inode1) != NULL) + ((_inode2) != NULL); \
-        SYS_LOCK(&dfc->lock, INT64_MAX, dfc_managed, (dfc, req, uuid)); \
+        SYS_LOCK(&dfc->lock, dfc_managed, (dfc, req, uuid)); \
     }
 
 DFC_MANAGE(access,       true,  loc->inode,     NULL)

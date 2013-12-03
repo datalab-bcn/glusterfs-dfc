@@ -637,7 +637,7 @@ SYS_LOCK_CREATE(dfc_sort_add, ((dfc_child_t *, child), (void *, data),
     if (sort->pending)
     {
         sort->pending = false;
-        SYS_LOCK(&child->lock, INT64_MAX, dfc_sort_send, (child, sort));
+        SYS_LOCK(&child->lock, dfc_sort_send, (child, sort));
     }
 
 failed:
@@ -654,8 +654,7 @@ void dfc_request_send(dfc_t * dfc, uint64_t mask, void * data, size_t size)
     {
         if ((mask & 1) != 0)
         {
-            SYS_LOCK(&child->lock, INT64_MAX,
-                     dfc_sort_add, (child, data, size));
+            SYS_LOCK(&child->lock, dfc_sort_add, (child, data, size));
         }
 
         mask >>= 1;
