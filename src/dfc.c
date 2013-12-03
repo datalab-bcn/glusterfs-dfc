@@ -1157,7 +1157,7 @@ err_t dfc_request_prepare(dfc_manager_t * dfc, dfc_request_t * req,
 
 void dfc_sort_client_process(dfc_request_t * req);
 
-void __dfc_serialize(dfc_client_t * client, int64_t txn)
+void __dfc_serialize(dfc_client_t * client, int64_t txn, bool ready)
 {
     dfc_request_t * req, ** preq;
     dfc_sort_t * sort;
@@ -1173,7 +1173,7 @@ void __dfc_serialize(dfc_client_t * client, int64_t txn)
             preq = &req->next;
             req = *preq;
         }
-        if ((req == NULL) || !req->ready)
+        if ((req == NULL) || (!ready && !req->ready))
         {
             break;
         }
@@ -1181,6 +1181,8 @@ void __dfc_serialize(dfc_client_t * client, int64_t txn)
 //        logI("Going to execute transaction %lu", txn);
 
         *preq = req->next;
+
+        req->ready = true;
 
         client->received_txn++;
         sort = req->sort;
@@ -1198,7 +1200,7 @@ void __dfc_serialize(dfc_client_t * client, int64_t txn)
 
 SYS_LOCK_DEFINE(dfc_serialize, ((dfc_client_t *, client), (int64_t, txn)))
 {
-    __dfc_serialize(client, txn);
+    __dfc_serialize(client, txn, false);
 
     SYS_UNLOCK(&client->lock);
 }
@@ -1252,9 +1254,7 @@ err_t dfc_sort_parse(dfc_client_t * client, void * sort, size_t size)
             req->bad = true;
         }
 
-        req->ready = true;
-
-        __dfc_serialize(client, txn);
+        __dfc_serialize(client, txn, true);
     }
 
     SYS_FREE(sort);
