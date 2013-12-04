@@ -175,7 +175,7 @@ SYS_ASYNC_CREATE(__dfc_test_lookup, ((call_frame_t *, frame), (xlator_t *, xl),
     {
         running = true;
         SYS_CALL(
-            dfc_prepare, (xl, 8, 4, loc->inode, &dfc, &xdata),
+            dfc_prepare, (xl, 64, 16, loc->inode, &dfc, &xdata),
             E(),
             GOTO(failed, &error)
         );
