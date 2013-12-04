@@ -84,6 +84,7 @@ struct _dfc_request
     int32_t          refs;
     bool             ro;
     bool             bad;
+    bool             sorted;
     bool             ready;
 };
 
@@ -1157,7 +1158,7 @@ err_t dfc_request_prepare(dfc_manager_t * dfc, dfc_request_t * req,
 
 void dfc_sort_client_process(dfc_request_t * req);
 
-void __dfc_serialize(dfc_client_t * client, int64_t txn, bool ready)
+void __dfc_serialize(dfc_client_t * client, int64_t txn)
 {
     dfc_request_t * req, ** preq;
     dfc_sort_t * sort;
@@ -1173,7 +1174,7 @@ void __dfc_serialize(dfc_client_t * client, int64_t txn, bool ready)
             preq = &req->next;
             req = *preq;
         }
-        if ((req == NULL) || (!ready && !req->ready))
+        if ((req == NULL) || !req->sorted)
         {
             break;
         }
@@ -1200,7 +1201,7 @@ void __dfc_serialize(dfc_client_t * client, int64_t txn, bool ready)
 
 SYS_LOCK_DEFINE(dfc_serialize, ((dfc_client_t *, client), (int64_t, txn)))
 {
-    __dfc_serialize(client, txn, false);
+    __dfc_serialize(client, txn);
 
     SYS_UNLOCK(&client->lock);
 }
@@ -1254,7 +1255,9 @@ err_t dfc_sort_parse(dfc_client_t * client, void * sort, size_t size)
             req->bad = true;
         }
 
-        __dfc_serialize(client, txn, true);
+        req->sorted = true;
+
+        __dfc_serialize(client, txn);
     }
 
     SYS_FREE(sort);
@@ -1477,6 +1480,7 @@ SYS_DELAY_CREATE(dfc_sort_client_process_timeout, ((dfc_request_t *, req)))
 {
     logW("Request %lu timed out", req->txn);
 
+    req->sorted = true;
     req->ready = true;
 
     dfc_sort_client_process(req);
@@ -1504,6 +1508,7 @@ SYS_LOCK_CREATE(dfc_managed, ((dfc_manager_t *, dfc), (dfc_request_t *, req),
     INIT_LIST_HEAD(&req->link2.cycle);
 
     req->bad = false;
+    req->sorted = false;
     req->ready = false;
 
     req->sort = NULL;
