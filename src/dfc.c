@@ -902,6 +902,11 @@ SYS_ASYNC_CREATE(dfc_link_del, ((xlator_t *, xl), (dfc_link_t *, link)))
     );
     root = (dfc_link_t *)(uintptr_t)value;
 
+    SYS_ASSERT(
+        (root == link) || !list_empty(&link->inode_list),
+        "Processed a request that is not the first one."
+    );
+
     if (!list_empty(&link->client_list))
     {
         tmp = list_entry(link->client_list.next, dfc_link_t, client_list);
@@ -991,12 +996,6 @@ SYS_ASYNC_CREATE(dfc_link_execute, ((dfc_link_t *, link)))
 SYS_CBK_CREATE(dfc_request_complete, data, ((dfc_request_t *, req)))
 {
     sys_gf_unwind(req->frame, 0, -1, NULL, NULL, (uintptr_t *)req, data);
-
-    SYS_ASSERT(
-        req->txn == req->client->next_txn,
-        "Current request does not correspond to the next transaction: "
-        "%ld, %ld", req->txn, req->client->next_txn
-    );
 
 //    logI("Completed request %ld", req->txn);
 
