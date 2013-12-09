@@ -1023,7 +1023,7 @@ void dfc_request_execute(dfc_request_t * req)
     else
     {
         logT("Request is bad");
-        sys_gf_unwind_error(req->frame, EIO, NULL, NULL, NULL,
+        sys_gf_unwind_error(req->frame, EUCLEAN, NULL, NULL, NULL,
                             (uintptr_t *)req, (uintptr_t *)req + DFC_REQ_SIZE);
 
         if (req->link1.inode != NULL)
@@ -1525,7 +1525,7 @@ SYS_LOCK_CREATE(dfc_managed, ((dfc_manager_t *, dfc), (dfc_request_t *, req),
 failed:
     SYS_UNLOCK(&dfc->lock);
 
-    sys_gf_unwind_error(req->frame, EIO, NULL, NULL, NULL, (uintptr_t *)req,
+    sys_gf_unwind_error(req->frame, EUCLEAN, NULL, NULL, NULL, (uintptr_t *)req,
                         (uintptr_t *)req + DFC_REQ_SIZE);
 }
 
@@ -1555,7 +1555,7 @@ SYS_LOCK_CREATE(__dfc_init_handler, ((dfc_manager_t *, dfc),
 failed:
     SYS_UNLOCK(&dfc->lock);
 
-    sys_gf_unwind_error(frame, EIO, NULL, NULL, NULL, data, data);
+    sys_gf_unwind_error(frame, EUCLEAN, NULL, NULL, NULL, data, data);
 }
 
 SYS_ASYNC_CREATE(dfc_init_handler, ((dfc_manager_t *, dfc),
@@ -1592,7 +1592,7 @@ SYS_ASYNC_CREATE(dfc_sort_handler, ((dfc_manager_t *, dfc),
     return;
 
 failed:
-    SYS_IO(sys_gf_getxattr_unwind_error, (frame, EIO, NULL), NULL);
+    SYS_IO(sys_gf_getxattr_unwind_error, (frame, EUCLEAN, NULL), NULL);
 }
 
 #define DFC_MANAGE(_fop, _ro, _inode1, _inode2) \
@@ -1684,7 +1684,7 @@ DFC_MANAGE(fxattrop,     false, fd->inode,      NULL)
             ); \
             return 0; \
         } \
-        sys_gf_##_fop##_unwind_error(frame, EIO, NULL); \
+        sys_gf_##_fop##_unwind_error(frame, EUCLEAN, NULL); \
         return 0; \
     }
 
@@ -1728,7 +1728,7 @@ static int32_t dfc_lookup(call_frame_t * frame, xlator_t * xl,
         }
     }
 
-    sys_gf_lookup_unwind_error(frame, EIO, NULL);
+    sys_gf_lookup_unwind_error(frame, EUCLEAN, NULL);
 
     return 0;
 }
@@ -1773,7 +1773,7 @@ static int32_t dfc_getxattr(call_frame_t * frame, xlator_t * xl,
         SYS_FREE(sort);
     }
 
-    sys_gf_getxattr_unwind_error(frame, EIO, NULL);
+    sys_gf_getxattr_unwind_error(frame, EUCLEAN, NULL);
 
     return 0;
 }
