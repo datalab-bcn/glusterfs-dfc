@@ -880,16 +880,19 @@ void dfc_end(dfc_transaction_t * txn, uint32_t count)
 {
     uint32_t state;
 
-    state = atomic_add_return(&txn->state, (count << 16) | count,
-                              memory_order_seq_cst);
-    if ((state >> 16) == 0)
+    if (txn != NULL)
     {
-        dfc_transaction_destroy(txn);
-    }
-    else if ((state & 0xFFFF) == 0)
-    {
-        dfc_request_send(txn->dfc, txn->mask, txn->sort.data,
-                         sizeof(txn->sort.data) - txn->sort.size);
+        state = atomic_add_return(&txn->state, (count << 16) | count,
+                                  memory_order_seq_cst);
+        if ((state >> 16) == 0)
+        {
+            dfc_transaction_destroy(txn);
+        }
+        else if ((state & 0xFFFF) == 0)
+        {
+            dfc_request_send(txn->dfc, txn->mask, txn->sort.data,
+                             sizeof(txn->sort.data) - txn->sort.size);
+        }
     }
 }
 
@@ -906,12 +909,15 @@ err_t dfc_attach(dfc_transaction_t * txn, dict_t ** xdata)
 
 bool dfc_complete(dfc_transaction_t * txn)
 {
-    if ((atomic_sub(&txn->state, 0x10000, memory_order_seq_cst) >> 16) == 1)
+    if (txn != NULL)
     {
-        dfc_transaction_destroy(txn);
+        if ((atomic_sub(&txn->state, 0x10000, memory_order_seq_cst) >> 16) != 1)
+        {
+            return false;
+        }
 
-        return true;
+        dfc_transaction_destroy(txn);
     }
 
-    return false;
+    return true;
 }
