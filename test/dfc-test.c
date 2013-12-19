@@ -73,6 +73,7 @@ failed:
             num_childs++; \
         } \
         dfc_end(txn, num_childs); \
+        sys_dict_release(xdata); \
         return; \
     failed: \
         SYS_IO(sys_gf_##_fop##_unwind_error, (frame, EIO, NULL), NULL, NULL); \
@@ -208,6 +209,8 @@ SYS_ASYNC_CREATE(__dfc_test_lookup, ((call_frame_t *, frame), (xlator_t *, xl),
         }
         dfc_end(txn, num_childs);
     }
+
+    sys_dict_release(xdata);
 
     return;
 
