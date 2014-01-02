@@ -1035,6 +1035,8 @@ void dfc_request_execute(dfc_request_t * req)
             dfc_link_del(req->xl, &req->link2);
         }
     }
+
+    sys_gf_args_free((uintptr_t *)req);
 }
 
 err_t dfc_request_dependencies(dfc_request_t * req, dfc_dependencies_t * deps)
@@ -1515,7 +1517,7 @@ SYS_LOCK_CREATE(dfc_managed, ((dfc_manager_t *, dfc), (dfc_request_t *, req),
 
 //    logI("Managing txn %ld", req->txn);
 
-    req->delay = SYS_DELAY(2000, dfc_sort_client_process_timeout, (req), 2);
+    req->delay = SYS_DELAY(2000, dfc_sort_client_process_timeout, (req), 1);
     SYS_LOCK(&client->lock, dfc_sort_client_add, (req));
 
     SYS_UNLOCK(&dfc->lock);
@@ -1527,6 +1529,8 @@ failed:
 
     sys_gf_unwind_error(req->frame, EUCLEAN, NULL, NULL, NULL, (uintptr_t *)req,
                         (uintptr_t *)req + DFC_REQ_SIZE);
+
+    sys_gf_args_free((uintptr_t *)req);
 }
 
 SYS_LOCK_CREATE(__dfc_init_handler, ((dfc_manager_t *, dfc),
@@ -1586,7 +1590,7 @@ SYS_ASYNC_CREATE(dfc_sort_handler, ((dfc_manager_t *, dfc),
         GOTO(failed)
     );
 
-    SYS_LOCK(&client->lock, 
+    SYS_LOCK(&client->lock,
              dfc_sort_client_recv, (client, frame, txn, sort, size));
 
     return;
