@@ -143,89 +143,6 @@ static loc_t * loc = &__loc;
     }
 */
 
-SYS_CBK_CREATE(__dfc_test_lookup_cbk, io, ((dfc_transaction_t *, txn)))
-{
-    if (dfc_complete(txn))
-    {
-        sys_gf_handler_call_lookup_unwind(NULL, 0, 0, NULL, NULL, io); \
-    }
-}
-
-static uint32_t total;
-
-SYS_CBK_CREATE(__dfc_test_init_lookup_cbk, io, ((dfc_t *, dfc)))
-{
-    if (atomic_dec(&total, memory_order_seq_cst) == 1)
-    {
-        sys_gf_handler_call_lookup_unwind(NULL, 0, 0, NULL, NULL, io); \
-        dfc_initialize(dfc);
-    }
-}
-
-SYS_ASYNC_CREATE(__dfc_test_lookup, ((call_frame_t *, frame), (xlator_t *, xl),
-                                     SYS_GF_ARGS_lookup))
-{
-    static bool running = false;
-    dfc_t * dfc;
-    dfc_transaction_t * txn;
-    xlator_list_t * list;
-    int32_t num_childs;
-    err_t error;
-
-    if (!running)
-    {
-        running = true;
-        SYS_CALL(
-            dfc_prepare, (xl, 64, 16, loc->inode, &dfc, &xdata),
-            E(),
-            GOTO(failed, &error)
-        );
-        total = 1;
-        for (list = xl->children; list != NULL; list = list->next)
-        {
-            atomic_inc(&total, memory_order_seq_cst);
-            SYS_IO(sys_gf_lookup_wind, (frame, NULL, list->xlator, loc, xdata),
-                   SYS_CBK(__dfc_test_init_lookup_cbk, (dfc)), NULL);
-        }
-        if (atomic_dec(&total, memory_order_seq_cst) == 1)
-        {
-            logE("Too fast !!!");
-        }
-    }
-    else
-    {
-        dfc = xl->private;
-        SYS_CALL(
-            dfc_test_txn, (xl->private, &xdata, &txn),
-            E(),
-            GOTO(failed)
-        );
-        num_childs = 0;
-        for (list = xl->children; list != NULL; list = list->next)
-        {
-            SYS_IO(sys_gf_lookup_wind, (frame, NULL, list->xlator, loc, xdata),
-                   SYS_CBK(__dfc_test_lookup_cbk, (txn)), NULL);
-            num_childs++;
-        }
-        dfc_end(txn, num_childs);
-    }
-
-    sys_dict_release(xdata);
-
-    return;
-
-failed:
-    SYS_IO(sys_gf_lookup_unwind_error, (frame, EIO, NULL), NULL, NULL);
-}
-
-static int32_t dfc_test_lookup(call_frame_t * frame, xlator_t * xl,
-                               loc_t * loc, dict_t * xdata)
-{
-    logT("DFC(lookup)");
-    SYS_ASYNC(__dfc_test_lookup, (frame, xl, loc, xdata));
-    return 0;
-}
-
 DFC_TEST_FOP(access)
 DFC_TEST_FOP(create)
 DFC_TEST_FOP(entrylk)
@@ -239,6 +156,7 @@ DFC_TEST_FOP(inodelk)
 DFC_TEST_FOP(finodelk)
 DFC_TEST_FOP(link)
 DFC_TEST_FOP(lk)
+DFC_TEST_FOP(lookup)
 DFC_TEST_FOP(mkdir)
 DFC_TEST_FOP(mknod)
 DFC_TEST_FOP(open)
@@ -288,36 +206,36 @@ static int32_t dfc_test_releasedir(xlator_t * xl, fd_t * fd)
 }
 
 static int32_t child_count;
-static int32_t child_up;
 
 int32_t notify(xlator_t * this, int32_t event, void * data, ...)
 {
-    switch (event)
-    {
-        case GF_EVENT_CHILD_UP:
-            if (atomic_inc(&child_up, memory_order_seq_cst) == child_count - 1)
-            {
-                logI("DFC test is UP");
-                return default_notify(this, event, data);
-            }
-            break;
-        case GF_EVENT_CHILD_DOWN:
-            if (atomic_dec(&child_up, memory_order_seq_cst) == child_count)
-            {
-                logI("DFC test is DOWN");
-                return default_notify(this, event, data);
-            }
-            break;
-        default:
-            return default_notify(this, event, data);
-    }
+    return dfc_default_notify(this->private, this, event, data);
+}
 
-    return 0;
+void dfc_notify(dfc_t * dfc, xlator_t * xl, int32_t event)
+{
+    if (event == DFC_CHILD_UP)
+    {
+        if (dfc->active == child_count)
+        {
+            logI("DFC test is UP");
+            default_notify(dfc->xl, GF_EVENT_CHILD_UP, NULL);
+        }
+    }
+    else if (event == DFC_CHILD_DOWN)
+    {
+        if (dfc->active == child_count - 1)
+        {
+            logI("DFC test is DOWN");
+            default_notify(dfc->xl, GF_EVENT_CHILD_DOWN, NULL);
+        }
+    }
 }
 
 int32_t init(xlator_t * xl)
 {
     xlator_list_t * list;
+    dfc_t * dfc;
 
     SYS_CALL(
         gfsys_initialize, (NULL, false),
@@ -325,18 +243,27 @@ int32_t init(xlator_t * xl)
         RETVAL(-1)
     );
 
-    child_up = 0;
     child_count = 0;
     for (list = xl->children; list != NULL; list = list->next)
     {
         child_count++;
     }
 
+    SYS_CALL(
+        dfc_initialize, (xl, 64, 16, dfc_notify, &dfc),
+        E(),
+        RETVAL(-1)
+    );
+
+    xl->private = dfc;
+
     return 0;
 }
 
 int32_t fini(xlator_t * xl)
 {
+    dfc_terminate(xl->private);
+
     return 0;
 }
 

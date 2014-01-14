@@ -41,62 +41,6 @@ typedef struct _dfc_sort_data
 } dfc_sort_data_t;
 */
 
-struct _dfc_sort
-{
-    void *  head;
-    size_t  size;
-    bool    pending;
-    uint8_t data[4096];
-};
-
-struct _dfc_request
-{
-    struct list_head list;
-    dfc_child_t *    child;
-    call_frame_t *   frame;
-    dfc_sort_t       sort;
-};
-
-struct _dfc_transaction
-{
-    sys_mutex_t      lock;
-    struct list_head list;
-    int64_t          id;
-    dfc_t *          dfc;
-    uint64_t         mask;
-    uint32_t         state;
-    dfc_sort_t       sort;
-};
-
-struct _dfc_child
-{
-    sys_lock_t       lock;
-    struct list_head list;
-    dfc_t *          dfc;
-    xlator_t *       xl;
-    int64_t          seq;
-    int32_t          idx;
-    uint32_t         count;
-    uint32_t         active;
-    struct list_head pool;
-    dfc_sort_t *     sort;
-};
-
-struct _dfc
-{
-    sys_mutex_t        lock;
-    uuid_t             uuid;
-    xlator_t *         xl;
-    loc_t              root_loc;
-    int64_t            current_txn;
-    int64_t            txn_mask;
-    uint32_t           max_requests;
-    uint32_t           requests;
-    uint32_t           count;
-    struct list_head   children;
-    struct list_head * txns;
-};
-
 int32_t __xdata_dump(dict_t * xdata, char * key, data_t * value, void * data)
 {
     logI("    %s: %u", key, value->len);
@@ -724,6 +668,7 @@ err_t dfc_child_create(dfc_t * dfc, xlator_t * xl, dfc_child_t ** child)
     tmp->active = 0;
     tmp->seq = 0;
     tmp->idx = dfc->count;
+    tmp->state = DFC_CHILD_DOWN;
     INIT_LIST_HEAD(&tmp->list);
     INIT_LIST_HEAD(&tmp->pool);
 
@@ -737,6 +682,13 @@ err_t dfc_child_create(dfc_t * dfc, xlator_t * xl, dfc_child_t ** child)
 void dfc_destroy(dfc_t * dfc)
 {
     dfc_child_t * child;
+
+    if (dfc->root_frame != NULL)
+    {
+        STACK_DESTROY(dfc->root_frame->root);
+    }
+
+    inode_unref(dfc->root_loc.inode);
 
     while (!list_empty(&dfc->children))
     {
@@ -756,7 +708,7 @@ void dfc_destroy(dfc_t * dfc)
 }
 
 err_t dfc_create(xlator_t * xl, uint32_t max_requests, uint32_t requests,
-                 inode_t * inode, dfc_t ** dfc)
+                 void (* notify)(dfc_t *, xlator_t *, int32_t), dfc_t ** dfc)
 {
     dfc_t * tmp;
     dfc_child_t * child;
@@ -777,14 +729,23 @@ err_t dfc_create(xlator_t * xl, uint32_t max_requests, uint32_t requests,
     memset(&tmp->root_loc, 0, sizeof(tmp->root_loc));
     tmp->root_loc.gfid[15] = 1;
     tmp->root_loc.path = "/";
-    tmp->root_loc.name = "";
-    tmp->root_loc.inode = inode_ref(inode);
+    tmp->root_loc.name = NULL;
+    tmp->root_loc.inode = inode_ref(xl->itable->root);
     tmp->max_requests = max_requests;
     tmp->requests = requests;
     INIT_LIST_HEAD(&tmp->children);
     uuid_generate(tmp->uuid);
-
+    tmp->root_frame = NULL;
     tmp->txns = NULL;
+    tmp->notify = notify;
+
+    SYS_PTR(
+        &tmp->root_frame, create_frame, (xl, xl->ctx->pool),
+        ENOMEM,
+        E(),
+        GOTO(failed, &error)
+    );
+
     SYS_CALLOC(
         &tmp->txns, 1024, gfdfc_mt_dfc_transaction_t,
         E(),
@@ -831,57 +792,172 @@ failed:
     return error;
 }
 
-err_t dfc_prepare(xlator_t * xl, uint32_t max_requests, uint32_t requests,
-                  inode_t * inode, dfc_t ** dfc, dict_t ** xdata)
+err_t dfc_initialize(xlator_t * xl, uint32_t max_requests, uint32_t requests,
+                     void (* notify)(dfc_t *, xlator_t *, int32_t),
+                     dfc_t ** dfc)
 {
     dfc_t * tmp;
-    err_t error;
+
+    if (xl->itable == NULL)
+    {
+        SYS_PTR(
+            &xl->itable, inode_table_new, (0, xl),
+            ENOMEM,
+            E(),
+            RETERR()
+        );
+    }
 
     SYS_CALL(
-        dfc_create, (xl, max_requests, requests, inode, &tmp),
+        dfc_create, (xl, max_requests, requests, notify, &tmp),
         E(),
         RETERR()
     );
 
-    SYS_CALL(
-        __dfc_attach, (tmp, 0, xdata, 0, xdata),
-        E(),
-        GOTO(failed, &error)
-    );
 
-    xl->private = tmp;
     *dfc = tmp;
 
     return 0;
-
-failed:
-    dfc_destroy(tmp);
-
-    return error;
 }
 
-SYS_ASYNC_CREATE(__dfc_initialize, ((dfc_t *, dfc)))
+void dfc_terminate(dfc_t * dfc)
 {
-    dfc_child_t * child;
+    dfc_destroy(dfc);
+}
+
+SYS_CBK_CREATE(__dfc_start_cbk, io, ((dfc_t *, dfc), (dfc_child_t *, child)))
+{
+    SYS_GF_WIND_CBK_TYPE(lookup) * args;
     dfc_sort_t sort;
     int32_t i;
 
-    dfc_sort_initialize(&sort);
-    list_for_each_entry(child, &dfc->children, list)
+    args = (SYS_GF_WIND_CBK_TYPE(lookup) *)io;
+
+    sys_mutex_lock(&dfc->lock);
+
+    if (child->state == DFC_CHILD_STARTING)
     {
-        for (i = 0; i < dfc->requests; i++)
+        if (args->op_ret == 0)
         {
-            SYS_CALL(
-                __dfc_sort_send, (child, &sort),
-                E()
-            );
+            child->state = DFC_CHILD_UP;
+            dfc->active++;
+            dfc_sort_initialize(&sort);
+            for (i = 0; i < dfc->requests; i++)
+            {
+                SYS_CALL(
+                    __dfc_sort_send, (child, &sort),
+                    E()
+                );
+            }
+            dfc->notify(dfc, child->xl, DFC_CHILD_UP);
+        }
+        else
+        {
+            logW("Child '%s' failed to start", child->xl->name);
+
+            child->state = DFC_CHILD_FAILED;
         }
     }
+    else if (child->state == DFC_CHILD_STOPPING)
+    {
+        child->state = DFC_CHILD_DOWN;
+    }
+
+    sys_mutex_unlock(&dfc->lock);
 }
 
-void dfc_initialize(dfc_t * dfc)
+SYS_ASYNC_CREATE(__dfc_start, ((dfc_t *, dfc), (xlator_t *, xl)))
 {
-    SYS_ASYNC(__dfc_initialize, (dfc));
+    dfc_sort_t sort;
+    dfc_child_t * child;
+    dict_t * xdata;
+
+    sys_mutex_lock(&dfc->lock);
+
+    list_for_each_entry(child, &dfc->children, list)
+    {
+        if (child->xl == xl)
+        {
+            if (child->state == DFC_CHILD_DOWN)
+            {
+                dfc_sort_initialize(&sort);
+                xdata = NULL;
+                SYS_CALL(
+                    __dfc_attach, (dfc, child->seq, sort.data,
+                                   sizeof(sort.data) - sort.size, &xdata),
+                    E(),
+                    LOG(E(), "Failed to prepare a DFC sort request."),
+                    BREAK()
+                );
+                child->state = DFC_CHILD_STARTING;
+
+                SYS_IO(
+                    sys_gf_lookup_wind, (dfc->root_frame, NULL, xl,
+                                         &dfc->root_loc, xdata),
+                    SYS_CBK(__dfc_start_cbk, (dfc, child)), NULL
+                );
+
+                sys_dict_release(xdata);
+            }
+            break;
+        }
+    }
+
+    sys_mutex_unlock(&dfc->lock);
+}
+
+void dfc_start(dfc_t * dfc, xlator_t * xl)
+{
+    SYS_ASYNC(__dfc_start, (dfc, xl));
+}
+
+void dfc_stop(dfc_t * dfc, xlator_t * xl)
+{
+    dfc_child_t * child;
+
+    sys_mutex_lock(&dfc->lock);
+
+    list_for_each_entry(child, &dfc->children, list)
+    {
+        if (child->xl == xl)
+        {
+            if (child->state == DFC_CHILD_UP)
+            {
+                child->state = DFC_CHILD_DOWN;
+                dfc->notify(dfc, child->xl, DFC_CHILD_DOWN);
+            }
+            else if (child->state == DFC_CHILD_STARTING)
+            {
+                child->state = DFC_CHILD_STOPPING;
+            }
+            else if (child->state == DFC_CHILD_FAILED)
+            {
+                child->state = DFC_CHILD_DOWN;
+            }
+            break;
+        }
+    }
+
+    sys_mutex_unlock(&dfc->lock);
+}
+
+int32_t dfc_default_notify(dfc_t * dfc, xlator_t * xl, int32_t event,
+                           void *data)
+{
+    if (event == GF_EVENT_CHILD_UP)
+    {
+        dfc_start(dfc, data);
+    }
+    else if (event == GF_EVENT_CHILD_DOWN)
+    {
+        dfc_stop(dfc, data);
+    }
+    else
+    {
+        return default_notify(xl, event, data);
+    }
+
+    return 0;
 }
 
 err_t dfc_begin(dfc_t * dfc, dfc_transaction_t ** txn)
