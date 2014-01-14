@@ -699,6 +699,8 @@ int32_t dfc_link_scan(dfc_link_t * root, dfc_link_t * node, int64_t id,
                 min = SYS_MIN(min, link->index);
             }
         }
+
+        size -= sizeof(uuid_t) + sizeof(int64_t);
     }
 
     if ((node->index == min) && (node->cycle.next == cycle))
@@ -807,7 +809,7 @@ dfc_request_t * dfc_link_allowed(dfc_link_t * link, dfc_link_t * root)
             } while (size > 0);
         }
 
-        logT("Remaining dependencies: %lu", new_size);
+        logT("Remaining dependencies for %s:%lu: %lu", dfc_uuid(uuid1, req->client->uuid), req->txn, new_size);
 
         req->sort_size = new_size;
         if (new_size == 0)
@@ -824,7 +826,7 @@ dfc_request_t * dfc_link_allowed(dfc_link_t * link, dfc_link_t * root)
             return NULL;
         }
 
-        logD("Cycle detected in request dependencies.");
+        logD("Cycle detected in request dependencies of %s:%lu", dfc_uuid(uuid1, req->client->uuid), req->txn);
 
         tmp = NULL;
         list_for_each_entry(node, &cycle, cycle)
@@ -891,6 +893,7 @@ SYS_ASYNC_CREATE(dfc_link_del, ((xlator_t *, xl), (dfc_link_t *, link)))
     dfc_request_t * req = NULL;
     uint64_t value;
     inode_t * inode;
+    char uuid1[64], uuid2[64];
 
     inode = link->inode;
     logT("Removing request from inode %p", inode);
@@ -917,6 +920,19 @@ SYS_ASYNC_CREATE(dfc_link_del, ((xlator_t *, xl), (dfc_link_t *, link)))
         list_add(&tmp->inode_list, &link->inode_list);
         list_del_init(&link->client_list);
     }
+    if (req == NULL)
+    {
+        tmp = list_entry(link->inode_list.next, dfc_link_t, inode_list);
+        while (tmp != link)
+        {
+            req = dfc_link_check(tmp, root);
+            if (req != NULL)
+            {
+                break;
+            }
+            tmp = list_entry(tmp->inode_list.next, dfc_link_t, inode_list);
+        }
+    }
 
     if (link == root)
     {
@@ -941,8 +957,8 @@ SYS_ASYNC_CREATE(dfc_link_del, ((xlator_t *, xl), (dfc_link_t *, link)))
 
     if (req != NULL)
     {
-        logT("Dispatching request %ld after request %ld", req->txn,
-             link->request->txn);
+        logT("Dispatching request %s:%ld after request %s:%ld", dfc_uuid(uuid1, req->client->uuid), req->txn,
+             dfc_uuid(uuid2, link->request->client->uuid), link->request->txn);
         dfc_request_execute(req);
     }
     else
@@ -958,6 +974,7 @@ SYS_ASYNC_CREATE(dfc_link_execute, ((dfc_link_t *, link)))
     dfc_link_t * root;
     dfc_request_t * req = NULL;
     uint64_t value;
+    char uuid1[64];
 
     logT("Evaluating order of execution on inode %p", link->inode);
 
@@ -988,16 +1005,18 @@ SYS_ASYNC_CREATE(dfc_link_execute, ((dfc_link_t *, link)))
     }
     else
     {
-//        logI("Request %ld cannot be executed yet on inode %p",
-//             link->request->txn, link->inode);
+        logT("Request %s:%ld cannot be executed yet on inode %p",
+             dfc_uuid(uuid1, link->request->client->uuid), link->request->txn, link->inode);
     }
 }
 
 SYS_CBK_CREATE(dfc_request_complete, data, ((dfc_request_t *, req)))
 {
+    char uuid1[64];
+
     sys_gf_unwind(req->frame, 0, -1, NULL, NULL, (uintptr_t *)req, data);
 
-//    logI("Completed request %ld", req->txn);
+    logT("Completed request %s:%ld", dfc_uuid(uuid1, req->client->uuid), req->txn);
 
     atomic_inc(&req->client->next_txn, memory_order_seq_cst);
 
@@ -1013,7 +1032,9 @@ SYS_CBK_CREATE(dfc_request_complete, data, ((dfc_request_t *, req)))
 
 void dfc_request_execute(dfc_request_t * req)
 {
-//    logI("Dispatching request %ld", req->txn);
+    char uuid1[64];
+
+    logT("Dispatching request %s:%ld", dfc_uuid(uuid1, req->client->uuid), req->txn);
     if (!req->bad)
     {
         sys_gf_wind(req->frame, NULL, FIRST_CHILD(req->xl),
