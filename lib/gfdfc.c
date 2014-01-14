@@ -466,12 +466,12 @@ err_t dfc_sort_process(dfc_t * dfc, dfc_child_t * child, dfc_sort_t * sort)
 
 SYS_CBK_CREATE(dfc_sort_recv, data, ((dfc_t *, dfc), (dfc_request_t *, req)))
 {
-    SYS_GF_CBK_CALL_TYPE(getxattr) * args;
+    SYS_GF_WIND_CBK_TYPE(getxattr) * args;
     dfc_sort_t * sort;
 
     atomic_dec(&req->child->active, memory_order_seq_cst);
 
-    args = (SYS_GF_CBK_CALL_TYPE(getxattr) *)data;
+    args = (SYS_GF_WIND_CBK_TYPE(getxattr) *)data;
 //    logT("Processing sort request:");
 //    if (args->dict != NULL)
 //    {
