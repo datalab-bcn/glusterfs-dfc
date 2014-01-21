@@ -1767,7 +1767,10 @@ static int32_t dfc_getxattr(call_frame_t * frame, xlator_t * xl,
     dfc_manager_t * dfc = xl->private;
     void * sort = NULL;
     logT("DFC(getxattr)");
-    dict_foreach(xdata, __dump_xdata, NULL);
+    if (xdata != NULL)
+    {
+        dict_foreach(xdata, __dump_xdata, NULL);
+    }
     err_t error = dfc_analyze(dfc, &xdata, uuid, &txn, &sort, &size);
 
     if (error == ENOENT)
