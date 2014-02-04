@@ -21,9 +21,11 @@
 #ifndef __GFDFC_H__
 #define __GFDFC_H__
 
-#define DFC_XATTR_UUID "trusted.dfc.uuid"
-#define DFC_XATTR_ID   "trusted.dfc.id"
-#define DFC_XATTR_SORT "trusted.dfc.sort"
+#define DFC_XATTR_UUID   "trusted.dfc.uuid"
+#define DFC_XATTR_ID     "trusted.dfc.id"
+#define DFC_XATTR_SORT   "trusted.dfc.sort"
+#define DFC_XATTR_OFFSET "trusted.dfc.offset"
+#define DFC_XATTR_SIZE   "trusted.dfc.size"
 
 #define DFC_CHILD_DOWN     0
 #define DFC_CHILD_STARTING 1

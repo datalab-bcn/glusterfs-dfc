@@ -31,6 +31,9 @@ typedef struct _dfc_dependencies dfc_dependencies_t;
 struct _dfc_link;
 typedef struct _dfc_link dfc_link_t;
 
+struct _dfc_inode;
+typedef struct _dfc_inode dfc_inode_t;
+
 struct _dfc_request;
 typedef struct _dfc_request dfc_request_t;
 
@@ -68,6 +71,14 @@ struct _dfc_link
     struct list_head inode_list;
 };
 
+struct _dfc_inode
+{
+    sys_lock_t lock;
+    size_t     size;
+    size_t     new_size;
+    size_t     update_size;
+};
+
 struct _dfc_request
 {
     struct list_head list;
@@ -80,6 +91,13 @@ struct _dfc_request
     dfc_link_t       link2;
     void *           sort;
     ssize_t          sort_size;
+    off_t            aux_offs;
+    size_t           aux_size;
+    ssize_t          size;
+    inode_t *        inode;
+    void          (* update)(dfc_request_t *, uintptr_t *);
+    fd_t *           fd;
+    loc_t            loc;
     uintptr_t *      delay;
     int32_t          refs;
     bool             ro;
@@ -107,6 +125,7 @@ struct _dfc_client
 struct _dfc_manager
 {
     sys_lock_t     lock;
+    call_frame_t * frame;
     uint64_t       graph;
     dfc_client_t * clients[256];
 };
@@ -1014,6 +1033,8 @@ SYS_CBK_CREATE(dfc_request_complete, data, ((dfc_request_t *, req)))
 {
     char uuid1[64];
 
+    req->update(req, data);
+
     sys_gf_unwind(req->frame, 0, -1, NULL, NULL, (uintptr_t *)req, data);
 
     logT("Completed request %s:%ld", dfc_uuid(uuid1, req->client->uuid), req->txn);
@@ -1030,6 +1051,90 @@ SYS_CBK_CREATE(dfc_request_complete, data, ((dfc_request_t *, req)))
     }
 }
 
+void dfc_size_save(dfc_request_t * req)
+{
+    dfc_inode_t * inode;
+    uint64_t value;
+
+    if ((req->inode != NULL) &&
+        (inode_ctx_get2(req->inode, req->xl, NULL, &value) == 0))
+    {
+        inode = (dfc_inode_t *)value;
+        req->size = inode->new_size;
+    }
+    else
+    {
+        req->size = 0;
+    }
+}
+
+dfc_inode_t * dfc_size_update(dfc_request_t * req, dict_t ** xdata)
+{
+    dfc_inode_t * inode;
+    uint64_t value, tmp;
+
+    inode = NULL;
+    value = -1;
+
+    if (inode_ctx_get2(req->inode, req->xl, NULL, &value) == 0)
+    {
+        inode = (dfc_inode_t *)value;
+        value = inode->size;
+    }
+
+    tmp = 0;
+    sys_dict_del_uint64(xdata, DFC_XATTR_SIZE, &tmp);
+    if (value == -1)
+    {
+        value = tmp;
+    }
+
+    if (req->inode != NULL)
+    {
+        if (inode == NULL)
+        {
+            SYS_MALLOC(
+                &inode, dfc_mt_dfc_inode_t,
+                E(),
+                NO_FAIL()
+            );
+            sys_lock_initialize(&inode->lock);
+            inode->size = -1;
+            inode->new_size = value;
+            inode->update_size = -1;
+        }
+
+        if (req->aux_offs != -1)
+        {
+            if (req->aux_size != -1)
+            {
+                tmp = SYS_MAX(value, req->aux_offs + req->aux_size);
+            }
+            else
+            {
+                tmp = req->aux_offs;
+            }
+
+            if (value != tmp)
+            {
+                value = tmp;
+                inode->new_size = tmp;
+            }
+        }
+
+        tmp = (uint64_t)(uintptr_t)inode;
+        SYS_CODE(
+            inode_ctx_set2, (req->inode, req->xl, NULL, &tmp),
+            EINVAL,
+            E()
+        );
+    }
+
+    req->size = value;
+
+    return inode;
+}
+
 void dfc_request_execute(dfc_request_t * req)
 {
     char uuid1[64];
@@ -1037,6 +1142,7 @@ void dfc_request_execute(dfc_request_t * req)
     logT("Dispatching request %s:%ld", dfc_uuid(uuid1, req->client->uuid), req->txn);
     if (!req->bad)
     {
+        dfc_size_save(req);
         sys_gf_wind(req->frame, NULL, FIRST_CHILD(req->xl),
                     SYS_CBK(dfc_request_complete, (req)),
                     NULL, (uintptr_t *)req, (uintptr_t *)req + DFC_REQ_SIZE);
@@ -1407,7 +1513,8 @@ err_t dfc_analyze_xattr(uint32_t * mask, uint32_t value, err_t error)
 }
 
 err_t dfc_analyze(dfc_manager_t * dfc, dict_t ** xdata, uuid_t uuid,
-                  int64_t * txn, void ** sort, size_t * size)
+                  int64_t * txn, void ** sort, size_t * size,
+                  off_t * aux_offs, size_t * aux_size)
 {
     size_t length;
     uint32_t mask;
@@ -1433,6 +1540,23 @@ err_t dfc_analyze(dfc_manager_t * dfc, dict_t ** xdata, uuid_t uuid,
     SYS_CALL(
         dfc_analyze_xattr, (&mask, 4, sys_dict_del_bin(xdata, DFC_XATTR_SORT,
                                                        data, &length)),
+        E(),
+        RETVAL(EINVAL)
+    );
+
+    *aux_offs = -1;
+    SYS_CALL(
+        dfc_analyze_xattr, (&mask, 8, sys_dict_del_int64(xdata,
+                                                         DFC_XATTR_OFFSET,
+                                                         aux_offs)),
+        E(),
+        RETVAL(EINVAL)
+    );
+    *aux_size = -1;
+    SYS_CALL(
+        dfc_analyze_xattr, (&mask, 16, sys_dict_del_uint64(xdata,
+                                                           DFC_XATTR_SIZE,
+                                                           aux_size)),
         E(),
         RETVAL(EINVAL)
     );
@@ -1620,69 +1744,275 @@ failed:
     SYS_IO(sys_gf_getxattr_unwind_error, (frame, EUCLEAN, NULL), NULL);
 }
 
-#define DFC_MANAGE(_fop, _ro, _inode1, _inode2) \
-    SYS_ASYNC_CREATE(dfc_managed_##_fop, ((dfc_manager_t *, dfc), \
-                                          (call_frame_t *, frame), \
-                                          (xlator_t *, xl), \
-                                          (uuid_t, uuid, ARRAY, \
-                                                         sizeof(uuid_t)), \
-                                          (int64_t, txn), \
-                                          SYS_GF_ARGS_##_fop)) \
+SYS_CBK_DECLARE(dfc_update_size_xattr_cbk, io,
+    (
+        (xlator_t *,     xl),
+        (loc_t,         loc, PTR,  sys_loc_acquire, sys_loc_release),
+        (dfc_inode_t *, inode)
+    ));
+
+SYS_CBK_DECLARE(dfc_update_size_xattr_fcbk, io,
+    (
+        (xlator_t *,     xl),
+        (fd_t *,        fd,  COPY, sys_fd_acquire, sys_fd_release),
+        (dfc_inode_t *, inode)
+    ));
+
+void dfc_update_size_xattr(xlator_t * xl, fd_t * fd, loc_t * loc,
+                           dfc_inode_t * inode)
+{
+    dfc_manager_t * dfc;
+    dict_t * dict;
+    size_t new_size;
+
+    new_size = inode->new_size;
+    if (inode->size == new_size)
+    {
+        return;
+    }
+
+    if (!atomic_cmpxchg(&inode->update_size, -1ULL, new_size,
+                        memory_order_seq_cst, memory_order_seq_cst))
+    {
+        return;
+    }
+
+    dict = NULL;
+    SYS_CALL(
+        sys_dict_set_uint64, (&dict, DFC_XATTR_SIZE, new_size, NULL),
+        E(),
+        GOTO(failed)
+    );
+
+    dfc = xl->private;
+
+    if (fd == NULL)
+    {
+        SYS_IO(
+            sys_gf_setxattr_wind, (dfc->frame, NULL, FIRST_CHILD(xl), loc,
+                                   dict, 0, NULL),
+            SYS_CBK(dfc_update_size_xattr_cbk, (xl, loc, inode))
+        );
+    }
+    else
+    {
+        SYS_IO(
+            sys_gf_fsetxattr_wind, (dfc->frame, NULL, FIRST_CHILD(xl), fd,
+                                    dict, 0, NULL),
+            SYS_CBK(dfc_update_size_xattr_fcbk, (xl, fd, inode))
+        );
+    }
+
+    sys_dict_release(dict);
+
+    return;
+
+failed:
+    inode->size = -1;
+}
+
+SYS_CBK_DEFINE(dfc_update_size_xattr_cbk, io,
+    (
+        (xlator_t *,     xl),
+        (loc_t,          loc, PTR,  sys_loc_acquire, sys_loc_release),
+        (dfc_inode_t *,  inode)
+    )
+)
+{
+    inode->size = inode->update_size;
+    atomic_store(&inode->update_size, -1, memory_order_seq_cst);
+    dfc_update_size_xattr(xl, NULL, loc, inode);
+}
+
+SYS_CBK_DEFINE(dfc_update_size_xattr_fcbk, io,
+    (
+        (xlator_t *,     xl),
+        (fd_t *,         fd,  COPY, sys_fd_acquire, sys_fd_release),
+        (dfc_inode_t *,  inode)
+    )
+)
+{
+    inode->size = inode->update_size;
+    atomic_store(&inode->update_size, -1, memory_order_seq_cst);
+    dfc_update_size_xattr(xl, fd, NULL, inode);
+}
+
+#define DFC_UPDATE(_fop, _inode, _pre, _post) \
+    void dfc_managed_##_fop##_update(dfc_request_t * req, uintptr_t * data) \
+    { \
+        size_t * psize; \
+        dfc_inode_t * inode; \
+        SYS_GF_WIND_CBK_TYPE(_fop) * args; \
+        args = (SYS_GF_WIND_CBK_TYPE(_fop) *)data; \
+        if (args->op_ret >= 0) \
+        { \
+            psize = SYS_SELECT(&args->_pre.ia_size, NULL, _pre); \
+            if (psize != NULL) \
+            { \
+                *psize = req->size; \
+            } \
+            req->inode = SYS_SELECT(args->_inode, req->inode, _inode); \
+            inode = dfc_size_update(req, &args->xdata); \
+            if (inode != NULL) \
+            { \
+                dfc_update_size_xattr(req->xl, req->fd, &req->loc, inode); \
+            } \
+            psize = SYS_SELECT(&args->_post.ia_size, NULL, _post); \
+            if (psize != NULL) \
+            { \
+                *psize = req->size; \
+            } \
+        } \
+    }
+
+void dfc_managed_readdir_update(dfc_request_t * req, uintptr_t * data)
+{
+    gf_dirent_t * entry;
+    SYS_GF_WIND_CBK_TYPE(readdir) * args;
+
+    args = (SYS_GF_WIND_CBK_TYPE(readdir) *)data;
+    if (args->op_ret >= 0)
+    {
+        list_for_each_entry(entry, &args->entries.list, list)
+        {
+            req->inode = entry->inode;
+            dfc_size_update(req, &entry->dict);
+            entry->d_stat.ia_size = req->size;
+        }
+    }
+}
+
+void dfc_managed_readdirp_update(dfc_request_t * req, uintptr_t * data)
+{
+    gf_dirent_t * entry;
+    SYS_GF_WIND_CBK_TYPE(readdirp) * args;
+
+    args = (SYS_GF_WIND_CBK_TYPE(readdirp) *)data;
+    if (args->op_ret >= 0)
+    {
+        list_for_each_entry(entry, &args->entries.list, list)
+        {
+            req->inode = entry->inode;
+            dfc_size_update(req, &entry->dict);
+            entry->d_stat.ia_size = req->size;
+        }
+    }
+}
+
+DFC_UPDATE(access,       ,          ,                        )
+DFC_UPDATE(create,       fd->inode, ,            buf         )
+DFC_UPDATE(entrylk,      ,          ,                        )
+DFC_UPDATE(fentrylk,     ,          ,                        )
+DFC_UPDATE(flush,        ,          ,                        )
+DFC_UPDATE(fsync,        ,          prebuf,      postbuf     )
+DFC_UPDATE(fsyncdir,     ,          ,                        )
+DFC_UPDATE(getxattr,     ,          ,                        )
+DFC_UPDATE(fgetxattr,    ,          ,                        )
+DFC_UPDATE(inodelk,      ,          ,                        )
+DFC_UPDATE(finodelk,     ,          ,                        )
+DFC_UPDATE(link,         inode,     ,            buf         )
+DFC_UPDATE(lk,           ,          ,                        )
+DFC_UPDATE(lookup,       inode,     ,            buf         )
+DFC_UPDATE(mkdir,        ,          ,                        )
+DFC_UPDATE(mknod,        ,          ,                        )
+DFC_UPDATE(open,         ,          ,                        )
+DFC_UPDATE(opendir,      ,          ,                        )
+DFC_UPDATE(rchecksum,    ,          ,                        )
+DFC_UPDATE(readlink,     ,          ,                        )
+DFC_UPDATE(readv,        ,          ,            stbuf       )
+DFC_UPDATE(removexattr,  ,          ,                        )
+DFC_UPDATE(fremovexattr, ,          ,                        )
+DFC_UPDATE(rename,       ,          ,            buf         )
+DFC_UPDATE(rmdir,        ,          ,                        )
+DFC_UPDATE(setattr,      ,          preop_stbuf, postop_stbuf)
+DFC_UPDATE(fsetattr,     ,          preop_stbuf, postop_stbuf)
+DFC_UPDATE(setxattr,     ,          ,                        )
+DFC_UPDATE(fsetxattr,    ,          ,                        )
+DFC_UPDATE(stat,         ,          ,            buf         )
+DFC_UPDATE(fstat,        ,          ,            buf         )
+DFC_UPDATE(statfs,       ,          ,                        )
+DFC_UPDATE(symlink,      ,          ,                        )
+DFC_UPDATE(truncate,     ,          prebuf,      postbuf     )
+DFC_UPDATE(ftruncate,    ,          prebuf,      postbuf     )
+DFC_UPDATE(unlink,       ,          ,                        )
+DFC_UPDATE(writev,       ,          prebuf,      postbuf     )
+DFC_UPDATE(xattrop,      ,          ,                        )
+DFC_UPDATE(fxattrop,     ,          ,                        )
+
+#define DFC_MANAGE(_fop, _ro, _fd, _loc, _inode1, _inode2, _inode3) \
+    SYS_ASYNC_CREATE(dfc_managed_##_fop, \
+        ( \
+            (dfc_manager_t *, dfc), \
+            (call_frame_t *,  frame), \
+            (xlator_t *,      xl), \
+            (uuid_t,          uuid, ARRAY, sizeof(uuid_t)), \
+            (int64_t,         txn), \
+            (off_t,           aux_offs), \
+            (size_t,          aux_size), \
+            SYS_GF_ARGS_##_fop \
+        ) \
+    ) \
     { \
         dfc_request_t * req; \
         req = (dfc_request_t *)SYS_GF_FOP(_fop, DFC_REQ_SIZE); \
         req->frame = frame; \
         req->xl = xl; \
         req->txn = txn; \
+        req->aux_offs = aux_offs; \
+        req->aux_size = aux_size; \
         req->ro = _ro; \
-        req->link1.inode = _inode1; \
-        req->link2.inode = _inode2; \
-        req->refs = ((_inode1) != NULL) + ((_inode2) != NULL); \
+        req->inode = _inode1; \
+        req->link1.inode = _inode2; \
+        req->link2.inode = _inode3; \
+        req->refs = ((_inode2) != NULL) + ((_inode3) != NULL); \
+        sys_loc_acquire(&req->loc, _loc); \
+        sys_fd_acquire(&req->fd, _fd); \
+        req->update = dfc_managed_##_fop##_update; \
         SYS_LOCK(&dfc->lock, dfc_managed, (dfc, req, uuid)); \
     }
 
-DFC_MANAGE(access,       true,  loc->inode,     NULL)
-DFC_MANAGE(create,       false, loc->parent,    NULL)
-DFC_MANAGE(entrylk,      true,  loc->parent,    NULL)
-DFC_MANAGE(fentrylk,     true,  fd->inode,      NULL)
+DFC_MANAGE(access,       true,  NULL, NULL, NULL,          loc->inode,     NULL)
+DFC_MANAGE(create,       false, fd,   NULL, NULL,          loc->parent,    NULL)
+DFC_MANAGE(entrylk,      true,  NULL, NULL, NULL,          loc->parent,    NULL)
+DFC_MANAGE(fentrylk,     true,  NULL, NULL, NULL,          fd->inode,      NULL)
 // TODO: Can flush, fsync and fsyncdir be really considered read-only ?
-DFC_MANAGE(flush,        true,  fd->inode,      NULL)
-DFC_MANAGE(fsync,        true,  fd->inode,      NULL)
-DFC_MANAGE(fsyncdir,     true,  fd->inode,      NULL)
-DFC_MANAGE(getxattr,     true,  loc->inode,     NULL)
-DFC_MANAGE(fgetxattr,    true,  fd->inode,      NULL)
-DFC_MANAGE(inodelk,      true,  loc->inode,     NULL)
-DFC_MANAGE(finodelk,     true,  fd->inode,      NULL)
-DFC_MANAGE(link,         false, oldloc->inode,  newloc->parent)
-DFC_MANAGE(lk,           true,  fd->inode,      NULL)
-DFC_MANAGE(lookup,       true,  loc->parent,    NULL)
-DFC_MANAGE(mkdir,        false, loc->parent,    NULL)
-DFC_MANAGE(mknod,        false, loc->parent,    NULL)
-DFC_MANAGE(open,         true,  loc->inode,     NULL)
-DFC_MANAGE(opendir,      true,  loc->inode,     NULL)
-DFC_MANAGE(rchecksum,    true,  fd->inode,      NULL)
-DFC_MANAGE(readdir,      true,  fd->inode,      NULL)
-DFC_MANAGE(readdirp,     true,  fd->inode,      NULL)
-DFC_MANAGE(readlink,     true,  loc->inode,     NULL)
-DFC_MANAGE(readv,        true,  fd->inode,      NULL)
-DFC_MANAGE(removexattr,  false, loc->inode,     NULL)
-DFC_MANAGE(fremovexattr, false, fd->inode,      NULL)
-DFC_MANAGE(rename,       false, oldloc->parent, newloc->parent)
-DFC_MANAGE(rmdir,        false, loc->parent,    loc->inode)
-DFC_MANAGE(setattr,      false, loc->inode,     NULL)
-DFC_MANAGE(fsetattr,     false, fd->inode,      NULL)
-DFC_MANAGE(setxattr,     false, loc->inode,     NULL)
-DFC_MANAGE(fsetxattr,    false, fd->inode,      NULL)
-DFC_MANAGE(stat,         true,  loc->inode,     NULL)
-DFC_MANAGE(fstat,        true,  fd->inode,      NULL)
-DFC_MANAGE(statfs,       true,  loc->inode,     NULL)
-DFC_MANAGE(symlink,      false, loc->parent,    NULL)
-DFC_MANAGE(truncate,     false, loc->inode,     NULL)
-DFC_MANAGE(ftruncate,    false, fd->inode,      NULL)
-DFC_MANAGE(unlink,       false, loc->parent,    loc->inode)
-DFC_MANAGE(writev,       false, fd->inode,      NULL)
-DFC_MANAGE(xattrop,      false, loc->inode,     NULL)
-DFC_MANAGE(fxattrop,     false, fd->inode,      NULL)
+DFC_MANAGE(flush,        true,  NULL, NULL, NULL,          fd->inode,      NULL)
+DFC_MANAGE(fsync,        true,  NULL, NULL, fd->inode,     fd->inode,      NULL)
+DFC_MANAGE(fsyncdir,     true,  NULL, NULL, NULL,          fd->inode,      NULL)
+DFC_MANAGE(getxattr,     true,  NULL, NULL, NULL,          loc->inode,     NULL)
+DFC_MANAGE(fgetxattr,    true,  NULL, NULL, NULL,          fd->inode,      NULL)
+DFC_MANAGE(inodelk,      true,  NULL, NULL, NULL,          loc->inode,     NULL)
+DFC_MANAGE(finodelk,     true,  NULL, NULL, NULL,          fd->inode,      NULL)
+DFC_MANAGE(link,         false, NULL, NULL, NULL,          oldloc->inode,  newloc->parent)
+DFC_MANAGE(lk,           true,  NULL, NULL, NULL,          fd->inode,      NULL)
+DFC_MANAGE(lookup,       true,  NULL, NULL, NULL,          loc->parent,    NULL)
+DFC_MANAGE(mkdir,        false, NULL, NULL, NULL,          loc->parent,    NULL)
+DFC_MANAGE(mknod,        false, NULL, NULL, NULL,          loc->parent,    NULL)
+DFC_MANAGE(open,         true,  NULL, NULL, NULL,          loc->inode,     NULL)
+DFC_MANAGE(opendir,      true,  NULL, NULL, NULL,          loc->inode,     NULL)
+DFC_MANAGE(rchecksum,    true,  NULL, NULL, NULL,          fd->inode,      NULL)
+DFC_MANAGE(readdir,      true,  NULL, NULL, NULL,          fd->inode,      NULL)
+DFC_MANAGE(readdirp,     true,  NULL, NULL, NULL,          fd->inode,      NULL)
+DFC_MANAGE(readlink,     true,  NULL, NULL, NULL,          loc->inode,     NULL)
+DFC_MANAGE(readv,        true,  NULL, NULL, fd->inode,     fd->inode,      NULL)
+DFC_MANAGE(removexattr,  false, NULL, NULL, NULL,          loc->inode,     NULL)
+DFC_MANAGE(fremovexattr, false, NULL, NULL, NULL,          fd->inode,      NULL)
+DFC_MANAGE(rename,       false, NULL, NULL, oldloc->inode, oldloc->parent, newloc->parent)
+DFC_MANAGE(rmdir,        false, NULL, NULL, NULL,          loc->parent,    loc->inode)
+DFC_MANAGE(setattr,      false, NULL, NULL, loc->inode,    loc->inode,     NULL)
+DFC_MANAGE(fsetattr,     false, NULL, NULL, fd->inode,     fd->inode,      NULL)
+DFC_MANAGE(setxattr,     false, NULL, NULL, NULL,          loc->inode,     NULL)
+DFC_MANAGE(fsetxattr,    false, NULL, NULL, NULL,          fd->inode,      NULL)
+DFC_MANAGE(stat,         true,  NULL, NULL, loc->inode,    loc->inode,     NULL)
+DFC_MANAGE(fstat,        true,  NULL, NULL, fd->inode,     fd->inode,      NULL)
+DFC_MANAGE(statfs,       true,  NULL, NULL, NULL,          loc->inode,     NULL)
+DFC_MANAGE(symlink,      false, NULL, NULL, NULL,          loc->parent,    NULL)
+DFC_MANAGE(truncate,     false, NULL, loc,  loc->inode,    loc->inode,     NULL)
+DFC_MANAGE(ftruncate,    false, fd,   NULL, fd->inode,     fd->inode,      NULL)
+DFC_MANAGE(unlink,       false, NULL, NULL, NULL,          loc->parent,    loc->inode)
+DFC_MANAGE(writev,       false, fd,   NULL, fd->inode,     fd->inode,      NULL)
+DFC_MANAGE(xattrop,      false, NULL, NULL, NULL,          loc->inode,     NULL)
+DFC_MANAGE(fxattrop,     false, NULL, NULL, NULL,          fd->inode,      NULL)
 
 #define DFC_FOP(_fop) \
     static int32_t dfc_##_fop(call_frame_t * frame, xlator_t * xl, \
@@ -1690,10 +2020,12 @@ DFC_MANAGE(fxattrop,     false, fd->inode,      NULL)
     { \
         uuid_t uuid; \
         int64_t txn; \
+        off_t aux_offs; \
+        size_t aux_size; \
         dfc_manager_t * dfc = xl->private; \
         logT("DFC(" #_fop ")"); \
         err_t error = dfc_analyze(dfc, &xdata, uuid, &txn, \
-                                  NULL, NULL); \
+                                  NULL, NULL, &aux_offs, &aux_size); \
         if (error == ENOENT) \
         { \
             sys_gf_##_fop##_wind_tail(frame, FIRST_CHILD(xl), \
@@ -1704,7 +2036,8 @@ DFC_MANAGE(fxattrop,     false, fd->inode,      NULL)
         { \
             logT("DFC(" #_fop ") managed"); \
             SYS_ASYNC( \
-                dfc_managed_##_fop, (dfc, frame, xl, uuid, txn, \
+                dfc_managed_##_fop, (dfc, frame, xl, uuid, txn, aux_offs, \
+                                     aux_size, \
                                      SYS_ARGS_NAMES((SYS_GF_ARGS_##_fop))) \
             ); \
             return 0; \
@@ -1713,16 +2046,110 @@ DFC_MANAGE(fxattrop,     false, fd->inode,      NULL)
         return 0; \
     }
 
+static int32_t dfc_readdir(call_frame_t * frame, xlator_t * xl,
+                           SYS_ARGS_DECL((SYS_GF_ARGS_readdir)))
+{
+    uuid_t uuid;
+    int64_t txn;
+    off_t aux_offs;
+    size_t aux_size;
+    dfc_manager_t * dfc = xl->private;
+    logT("DFC(readdir)");
+    err_t error = dfc_analyze(dfc, &xdata, uuid, &txn,
+                              NULL, NULL, &aux_offs, &aux_size);
+    if (error == ENOENT)
+    {
+        sys_gf_readdir_wind_tail(frame, FIRST_CHILD(xl),
+                                 SYS_ARGS_NAMES((SYS_GF_ARGS_readdir)));
+        return 0;
+    }
+    if (error == 0)
+    {
+        logT("DFC(readdir) managed");
+        sys_dict_acquire(&xdata, xdata);
+        SYS_CALL(
+            sys_dict_set_uint64, (&xdata, DFC_XATTR_SIZE, 0, NULL),
+            E(),
+            GOTO(failed)
+        );
+        SYS_ASYNC(
+            dfc_managed_readdir, (dfc, frame, xl, uuid, txn, aux_offs,
+                                  aux_size,
+                                  SYS_ARGS_NAMES((SYS_GF_ARGS_readdir)))
+        );
+        sys_dict_release(xdata);
+
+        return 0;
+    }
+
+    sys_gf_readdir_unwind_error(frame, EUCLEAN, NULL);
+
+    return 0;
+
+failed:
+    sys_gf_readdir_unwind_error(frame, EIO, NULL);
+
+    return 0;
+}
+
+static int32_t dfc_readdirp(call_frame_t * frame, xlator_t * xl,
+                            SYS_ARGS_DECL((SYS_GF_ARGS_readdirp)))
+{
+    uuid_t uuid;
+    int64_t txn;
+    off_t aux_offs;
+    size_t aux_size;
+    dfc_manager_t * dfc = xl->private;
+    logT("DFC(readdirp)");
+    err_t error = dfc_analyze(dfc, &xdata, uuid, &txn,
+                              NULL, NULL, &aux_offs, &aux_size);
+    if (error == ENOENT)
+    {
+        sys_gf_readdirp_wind_tail(frame, FIRST_CHILD(xl),
+                                  SYS_ARGS_NAMES((SYS_GF_ARGS_readdirp)));
+        return 0;
+    }
+    if (error == 0)
+    {
+        logT("DFC(readdirp) managed");
+        sys_dict_acquire(&xdata, xdata);
+        SYS_CALL(
+            sys_dict_set_uint64, (&xdata, DFC_XATTR_SIZE, 0, NULL),
+            E(),
+            GOTO(failed)
+        );
+        SYS_ASYNC(
+            dfc_managed_readdirp, (dfc, frame, xl, uuid, txn, aux_offs,
+                                   aux_size,
+                                   SYS_ARGS_NAMES((SYS_GF_ARGS_readdirp)))
+        );
+        sys_dict_release(xdata);
+
+        return 0;
+    }
+
+    sys_gf_readdirp_unwind_error(frame, EUCLEAN, NULL);
+
+    return 0;
+
+failed:
+    sys_gf_readdirp_unwind_error(frame, EIO, NULL);
+
+    return 0;
+}
+
 static int32_t dfc_lookup(call_frame_t * frame, xlator_t * xl,
                           SYS_ARGS_DECL((SYS_GF_ARGS_lookup)))
 {
     uuid_t uuid;
     int64_t txn;
-    size_t size;
+    off_t aux_offs;
+    size_t size, aux_size;
     dfc_manager_t * dfc = xl->private;
     void * sort = NULL;
     logT("DFC(lookup)");
-    err_t error = dfc_analyze(dfc, &xdata, uuid, &txn, &sort, &size);
+    err_t error = dfc_analyze(dfc, &xdata, uuid, &txn, &sort, &size,
+                              &aux_offs, &aux_size);
 
     if (error == ENOENT)
     {
@@ -1735,10 +2162,18 @@ static int32_t dfc_lookup(call_frame_t * frame, xlator_t * xl,
         if (sort == NULL)
         {
             logT("DFC(lookup) managed");
+            sys_dict_acquire(&xdata, xdata);
+            SYS_CALL(
+                sys_dict_set_uint64, (&xdata, DFC_XATTR_SIZE, 0, NULL),
+                E(),
+                GOTO(failed)
+            );
             SYS_ASYNC(
-                dfc_managed_lookup, (dfc, frame, xl, uuid, txn,
+                dfc_managed_lookup, (dfc, frame, xl, uuid, txn, aux_offs,
+                                     aux_size,
                                      SYS_ARGS_NAMES((SYS_GF_ARGS_lookup)))
             );
+            sys_dict_release(xdata);
             return 0;
         }
         if ((loc->name == NULL) && (strcmp(loc->path, "/") == 0))
@@ -1756,6 +2191,11 @@ static int32_t dfc_lookup(call_frame_t * frame, xlator_t * xl,
     sys_gf_lookup_unwind_error(frame, EUCLEAN, NULL);
 
     return 0;
+
+failed:
+    sys_gf_lookup_unwind_error(frame, EIO, NULL);
+
+    return 0;
 }
 
 static int32_t dfc_getxattr(call_frame_t * frame, xlator_t * xl,
@@ -1763,7 +2203,8 @@ static int32_t dfc_getxattr(call_frame_t * frame, xlator_t * xl,
 {
     uuid_t uuid;
     int64_t txn;
-    size_t size;
+    off_t aux_offs;
+    size_t size, aux_size;
     dfc_manager_t * dfc = xl->private;
     void * sort = NULL;
     logT("DFC(getxattr)");
@@ -1771,7 +2212,8 @@ static int32_t dfc_getxattr(call_frame_t * frame, xlator_t * xl,
     {
         dict_foreach(xdata, __dump_xdata, NULL);
     }
-    err_t error = dfc_analyze(dfc, &xdata, uuid, &txn, &sort, &size);
+    err_t error = dfc_analyze(dfc, &xdata, uuid, &txn, &sort, &size,
+                              &aux_offs, &aux_size);
 
     if (error == ENOENT)
     {
@@ -1785,7 +2227,8 @@ static int32_t dfc_getxattr(call_frame_t * frame, xlator_t * xl,
         {
             logT("DFC(getxattr) managed");
             SYS_ASYNC(
-                dfc_managed_getxattr, (dfc, frame, xl, uuid, txn,
+                dfc_managed_getxattr, (dfc, frame, xl, uuid, txn, aux_offs,
+                                       aux_size,
                                        SYS_ARGS_NAMES((SYS_GF_ARGS_getxattr)))
             );
             return 0;
@@ -1823,8 +2266,6 @@ DFC_FOP(mknod)
 DFC_FOP(open)
 DFC_FOP(opendir)
 DFC_FOP(rchecksum)
-DFC_FOP(readdir)
-DFC_FOP(readdirp)
 DFC_FOP(readlink)
 DFC_FOP(readv)
 DFC_FOP(removexattr)
@@ -1904,6 +2345,13 @@ int32_t init(xlator_t * this)
         GOTO(failed, &error)
     );
 
+    SYS_PTR(
+        &dfc->frame, create_frame, (this, this->ctx->pool),
+        ENOMEM,
+        E(),
+        GOTO(failed_dfc, &error)
+    );
+
     sys_lock_initialize(&dfc->lock);
 /*
     SYS_CALL(
@@ -1918,6 +2366,8 @@ int32_t init(xlator_t * this)
 
     return 0;
 
+failed_dfc:
+    SYS_FREE(dfc);
 failed:
     logE("The Distributed FOP Coordinator translator could not start. "
          "Error %d", error);
@@ -1927,9 +2377,15 @@ failed:
 
 void fini(xlator_t * this)
 {
+    dfc_manager_t * dfc;
+
     SYS_ASSERT(this != NULL, "Current translator is NULL");
 
-    SYS_FREE(this->private);
+    dfc = this->private;
+    this->private = NULL;
+
+    STACK_DESTROY(dfc->frame->root);
+    SYS_FREE(dfc);
 }
 
 SYS_GF_FOP_TABLE(dfc);

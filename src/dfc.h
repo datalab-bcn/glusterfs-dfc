@@ -23,16 +23,19 @@
 
 #define DFC_XATTR "trusted.dfc"
 
-#define DFC_XATTR_UUID DFC_XATTR ".uuid"
-#define DFC_XATTR_ID   DFC_XATTR ".id"
-#define DFC_XATTR_SORT DFC_XATTR ".sort"
-#define DFC_XATTR_TIME DFC_XATTR ".time"
+#define DFC_XATTR_UUID   DFC_XATTR ".uuid"
+#define DFC_XATTR_ID     DFC_XATTR ".id"
+#define DFC_XATTR_SORT   DFC_XATTR ".sort"
+#define DFC_XATTR_TIME   DFC_XATTR ".time"
+#define DFC_XATTR_OFFSET DFC_XATTR ".offset"
+#define DFC_XATTR_SIZE   DFC_XATTR ".size"
 
 enum dfc_mem_types
 {
     dfc_mt_dfc_manager_t = sys_mt_end + 1,
     dfc_mt_dfc_client_t,
     dfc_mt_dfc_sort_t,
+    dfc_mt_dfc_inode_t,
     dfc_mt_end
 };
 
