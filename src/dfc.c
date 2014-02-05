@@ -1039,7 +1039,10 @@ SYS_CBK_CREATE(dfc_request_complete, data, ((dfc_request_t *, req)))
 
     logT("Completed request %s:%ld", dfc_uuid(uuid1, req->client->uuid), req->txn);
 
-    atomic_inc(&req->client->next_txn, memory_order_seq_cst);
+    if (req->client != NULL)
+    {
+        atomic_inc(&req->client->next_txn, memory_order_seq_cst);
+    }
 
     if (req->link1.inode != NULL)
     {
@@ -1049,6 +1052,8 @@ SYS_CBK_CREATE(dfc_request_complete, data, ((dfc_request_t *, req)))
     {
         dfc_link_del(req->xl, &req->link2);
     }
+
+    sys_gf_args_free((uintptr_t *)req);
 }
 
 void dfc_size_save(dfc_request_t * req)
@@ -1061,9 +1066,11 @@ void dfc_size_save(dfc_request_t * req)
     {
         inode = (dfc_inode_t *)value;
         req->size = inode->new_size;
+        logD("DFC: pre size: size from inode: %lu", req->size);
     }
     else
     {
+        logD("DFC: pre size: no size from");
         req->size = 0;
     }
 }
@@ -1080,10 +1087,22 @@ dfc_inode_t * dfc_size_update(dfc_request_t * req, dict_t ** xdata)
     {
         inode = (dfc_inode_t *)value;
         value = inode->size;
+        logD("DFC: post size: size from inode: %lu", value);
+    }
+    else
+    {
+        logD("DFC: post size: no size from");
     }
 
     tmp = 0;
-    sys_dict_del_uint64(xdata, DFC_XATTR_SIZE, &tmp);
+    if (sys_dict_del_uint64(xdata, DFC_XATTR_VSIZE, &tmp) == 0)
+    {
+        logD("DFC: post size: size from xattr: %lu", tmp);
+    }
+    else
+    {
+        logD("DFC: post size: no size from xattr");
+    }
     if (value == -1)
     {
         value = tmp;
@@ -1115,6 +1134,7 @@ dfc_inode_t * dfc_size_update(dfc_request_t * req, dict_t ** xdata)
                 tmp = req->aux_offs;
             }
 
+            logD("DFC: updating size %lu -> %lu", value, tmp);
             if (value != tmp)
             {
                 value = tmp;
@@ -1161,9 +1181,9 @@ void dfc_request_execute(dfc_request_t * req)
         {
             dfc_link_del(req->xl, &req->link2);
         }
-    }
 
-    sys_gf_args_free((uintptr_t *)req);
+        sys_gf_args_free((uintptr_t *)req);
+    }
 }
 
 err_t dfc_request_dependencies(dfc_request_t * req, dfc_dependencies_t * deps)
@@ -1561,7 +1581,7 @@ err_t dfc_analyze(dfc_manager_t * dfc, dict_t ** xdata, uuid_t uuid,
         RETVAL(EINVAL)
     );
 
-    if (mask == 0)
+    if ((mask & 7) == 0)
     {
         return ENOENT;
     }
@@ -1678,12 +1698,15 @@ failed:
     sys_gf_args_free((uintptr_t *)req);
 }
 
-SYS_LOCK_CREATE(__dfc_init_handler, ((dfc_manager_t *, dfc),
-                                     (call_frame_t *, frame),
-                                     (xlator_t *, xl),
-                                     (uuid_t, uuid, ARRAY, sizeof(uuid_t)),
-                                     (int64_t, txn),
-                                     (uintptr_t *, data)))
+SYS_LOCK_CREATE(dfc_init_handler, ((dfc_manager_t *, dfc),
+                                   (call_frame_t *, frame),
+                                   (xlator_t *, xl),
+                                   (uuid_t, uuid, ARRAY, sizeof(uuid_t)),
+                                   (int64_t, txn),
+                                   (loc_t, loc, PTR, sys_loc_acquire,
+                                                     sys_loc_release),
+                                   (dict_t *, xdata, COPY, sys_dict_acquire,
+                                                           sys_dict_release)))
 {
     dfc_client_t * client;
 
@@ -1697,34 +1720,24 @@ SYS_LOCK_CREATE(__dfc_init_handler, ((dfc_manager_t *, dfc),
 
     dfc_client_put(client);
 
-    sys_gf_wind_tail(frame, FIRST_CHILD(xl), NULL, NULL, data, data);
+    SYS_IO(
+        sys_gf_lookup_wind_tail, (frame, FIRST_CHILD(xl), loc, xdata),
+        NULL, NULL
+    );
 
     return;
 
 failed:
     SYS_UNLOCK(&dfc->lock);
 
-    sys_gf_unwind_error(frame, EUCLEAN, NULL, NULL, NULL, data, data);
+    SYS_IO(
+        sys_gf_lookup_unwind_error, (frame, EUCLEAN, NULL),
+        NULL, NULL
+    );
 }
 
-SYS_ASYNC_CREATE(dfc_init_handler, ((dfc_manager_t *, dfc),
-                                    (call_frame_t *, frame),
-                                    (xlator_t *, xl),
-                                    (uuid_t, uuid, ARRAY, sizeof(uuid_t)),
-                                    (int64_t, txn),
-                                    SYS_GF_ARGS_lookup))
-{
-    uintptr_t * data = SYS_GF_FOP(lookup);
-    SYS_LOCK(&dfc->lock,
-             __dfc_init_handler, (dfc, frame, xl, uuid, txn, data));
-}
-
-SYS_ASYNC_CREATE(dfc_sort_handler, ((dfc_manager_t *, dfc),
-                                    (call_frame_t *, frame),
-                                    (xlator_t *, xl),
-                                    (uuid_t, uuid, ARRAY, sizeof(uuid_t)),
-                                    (int64_t, txn), (void *, sort),
-                                    (size_t, size)))
+void dfc_sort_handler(dfc_manager_t * dfc, call_frame_t * frame, xlator_t * xl,
+                      uuid_t uuid, int64_t txn, void * sort, size_t size)
 {
     dfc_client_t * client;
 
@@ -1779,7 +1792,7 @@ void dfc_update_size_xattr(xlator_t * xl, fd_t * fd, loc_t * loc,
 
     dict = NULL;
     SYS_CALL(
-        sys_dict_set_uint64, (&dict, DFC_XATTR_SIZE, new_size, NULL),
+        sys_dict_set_uint64, (&dict, DFC_XATTR_VSIZE, new_size, NULL),
         E(),
         GOTO(failed)
     );
@@ -1939,37 +1952,180 @@ DFC_UPDATE(writev,       ,          prebuf,      postbuf     )
 DFC_UPDATE(xattrop,      ,          ,                        )
 DFC_UPDATE(fxattrop,     ,          ,                        )
 
+#define DFC_CHECK(_fop) \
+    static inline err_t dfc_check_##_fop(dfc_manager_t * dfc, \
+                                         call_frame_t * frame, xlator_t * xl, \
+                                         dict_t ** xdata, uuid_t uuid, \
+                                         int64_t * txn, off_t * aux_offs, \
+                                         size_t * aux_size, loc_t * loc) \
+    { \
+        return dfc_analyze(dfc, xdata, uuid, txn, NULL, NULL, aux_offs, \
+                           aux_size); \
+    }
+
+static inline err_t dfc_check_lookup(dfc_manager_t * dfc, call_frame_t * frame,
+                                     xlator_t * xl, dict_t ** xdata,
+                                     uuid_t uuid, int64_t * txn,
+                                     off_t * aux_offs, size_t * aux_size,
+                                     loc_t * loc)
+{
+    void * sort;
+    size_t size;
+    err_t error;
+
+    sort = NULL;
+    error = dfc_analyze(dfc, xdata, uuid, txn, &sort, &size, aux_offs,
+                        aux_size);
+
+    if ((error == 0) && (sort != NULL))
+    {
+        SYS_FREE(sort);
+        if ((loc->name == NULL) && (strcmp(loc->path, "/") == 0))
+        {
+            logT("DFC(lookup) init");
+            SYS_LOCK(
+                &dfc->lock,
+                dfc_init_handler, (dfc, frame, xl, uuid, *txn, loc, *xdata)
+            );
+
+            return EALREADY;
+        }
+
+        return EINVAL;
+    }
+
+    if (sort != NULL)
+    {
+        SYS_FREE(sort);
+
+        return EINVAL;
+    }
+
+    return error;
+}
+
+static inline err_t dfc_check_getxattr(dfc_manager_t * dfc,
+                                       call_frame_t * frame, xlator_t * xl,
+                                       dict_t ** xdata, uuid_t uuid,
+                                       int64_t * txn, off_t * aux_offs,
+                                       size_t * aux_size, loc_t * loc)
+{
+    void * sort;
+    size_t size;
+    err_t error;
+
+    sort = NULL;
+    error = dfc_analyze(dfc, xdata, uuid, txn, &sort, &size, aux_offs,
+                        aux_size);
+
+    if ((error == 0) && (sort != NULL))
+    {
+        if ((loc->name == NULL) && (strcmp(loc->path, "/") == 0))
+        {
+            logT("DFC(getxattr) sort");
+            dfc_sort_handler(dfc, frame, xl, uuid, *txn, sort, size);
+
+            return EALREADY;
+        }
+
+        SYS_FREE(sort);
+
+        return EINVAL;
+    }
+
+    if (sort != NULL)
+    {
+        SYS_FREE(sort);
+
+        return EINVAL;
+    }
+
+    return error;
+}
+
+DFC_CHECK(access)
+DFC_CHECK(create)
+DFC_CHECK(entrylk)
+DFC_CHECK(fentrylk)
+DFC_CHECK(flush)
+DFC_CHECK(fsync)
+DFC_CHECK(fsyncdir)
+DFC_CHECK(fgetxattr)
+DFC_CHECK(inodelk)
+DFC_CHECK(finodelk)
+DFC_CHECK(link)
+DFC_CHECK(lk)
+DFC_CHECK(mkdir)
+DFC_CHECK(mknod)
+DFC_CHECK(open)
+DFC_CHECK(opendir)
+DFC_CHECK(rchecksum)
+DFC_CHECK(readlink)
+DFC_CHECK(readdir)
+DFC_CHECK(readdirp)
+DFC_CHECK(readv)
+DFC_CHECK(removexattr)
+DFC_CHECK(fremovexattr)
+DFC_CHECK(rename)
+DFC_CHECK(rmdir)
+DFC_CHECK(setattr)
+DFC_CHECK(fsetattr)
+DFC_CHECK(setxattr)
+DFC_CHECK(fsetxattr)
+DFC_CHECK(stat)
+DFC_CHECK(fstat)
+DFC_CHECK(statfs)
+DFC_CHECK(symlink)
+DFC_CHECK(truncate)
+DFC_CHECK(ftruncate)
+DFC_CHECK(unlink)
+DFC_CHECK(writev)
+DFC_CHECK(xattrop)
+DFC_CHECK(fxattrop)
+
 #define DFC_MANAGE(_fop, _ro, _fd, _loc, _inode1, _inode2, _inode3) \
-    SYS_ASYNC_CREATE(dfc_managed_##_fop, \
-        ( \
-            (dfc_manager_t *, dfc), \
-            (call_frame_t *,  frame), \
-            (xlator_t *,      xl), \
-            (uuid_t,          uuid, ARRAY, sizeof(uuid_t)), \
-            (int64_t,         txn), \
-            (off_t,           aux_offs), \
-            (size_t,          aux_size), \
-            SYS_GF_ARGS_##_fop \
-        ) \
-    ) \
+    SYS_ASYNC_CREATE(dfc_managed_##_fop, ((call_frame_t *, frame), \
+                                          (xlator_t *, xl), \
+                                          SYS_GF_ARGS_##_fop)) \
     { \
         dfc_request_t * req; \
-        req = (dfc_request_t *)SYS_GF_FOP(_fop, DFC_REQ_SIZE); \
-        req->frame = frame; \
-        req->xl = xl; \
-        req->txn = txn; \
-        req->aux_offs = aux_offs; \
-        req->aux_size = aux_size; \
-        req->ro = _ro; \
-        req->inode = _inode1; \
-        req->link1.inode = _inode2; \
-        req->link2.inode = _inode3; \
-        req->refs = ((_inode2) != NULL) + ((_inode3) != NULL); \
-        sys_loc_acquire(&req->loc, _loc); \
-        sys_fd_acquire(&req->fd, _fd); \
-        req->update = dfc_managed_##_fop##_update; \
-        SYS_LOCK(&dfc->lock, dfc_managed, (dfc, req, uuid)); \
-    }
+        uuid_t uuid; \
+        int64_t txn; \
+        off_t aux_offs; \
+        size_t aux_size; \
+        dfc_manager_t * dfc = xl->private; \
+        err_t error = dfc_check_##_fop(dfc, frame, xl, &xdata, uuid, &txn, \
+                                       &aux_offs, &aux_size, _loc); \
+        if (error != EALREADY) \
+        { \
+            req = (dfc_request_t *)SYS_GF_FOP(_fop, DFC_REQ_SIZE); \
+            req->frame = frame; \
+            req->xl = xl; \
+            req->txn = txn; \
+            req->aux_offs = aux_offs; \
+            req->aux_size = aux_size; \
+            req->ro = _ro; \
+            req->inode = _inode1; \
+            sys_loc_acquire(&req->loc, _loc); \
+            sys_fd_acquire(&req->fd, _fd); \
+            req->update = dfc_managed_##_fop##_update; \
+            if (error == 0) \
+            { \
+                logT("DFC(" #_fop ") managed"); \
+                req->link1.inode = _inode2; \
+                req->link2.inode = _inode3; \
+                req->refs = ((_inode2) != NULL) + ((_inode3) != NULL); \
+                SYS_LOCK(&dfc->lock, dfc_managed, (dfc, req, uuid)); \
+                return; \
+            } \
+            req->client = NULL; \
+            req->link1.inode = NULL; \
+            req->link2.inode = NULL; \
+            req->refs = 0; \
+            req->bad = error != ENOENT; \
+            dfc_request_execute(req); \
+        } \
+    } \
 
 DFC_MANAGE(access,       true,  NULL, NULL, NULL,          loc->inode,     NULL)
 DFC_MANAGE(create,       false, fd,   NULL, NULL,          loc->parent,    NULL)
@@ -1979,13 +2135,13 @@ DFC_MANAGE(fentrylk,     true,  NULL, NULL, NULL,          fd->inode,      NULL)
 DFC_MANAGE(flush,        true,  NULL, NULL, NULL,          fd->inode,      NULL)
 DFC_MANAGE(fsync,        true,  NULL, NULL, fd->inode,     fd->inode,      NULL)
 DFC_MANAGE(fsyncdir,     true,  NULL, NULL, NULL,          fd->inode,      NULL)
-DFC_MANAGE(getxattr,     true,  NULL, NULL, NULL,          loc->inode,     NULL)
+DFC_MANAGE(getxattr,     true,  NULL, loc,  NULL,          loc->inode,     NULL)
 DFC_MANAGE(fgetxattr,    true,  NULL, NULL, NULL,          fd->inode,      NULL)
 DFC_MANAGE(inodelk,      true,  NULL, NULL, NULL,          loc->inode,     NULL)
 DFC_MANAGE(finodelk,     true,  NULL, NULL, NULL,          fd->inode,      NULL)
 DFC_MANAGE(link,         false, NULL, NULL, NULL,          oldloc->inode,  newloc->parent)
 DFC_MANAGE(lk,           true,  NULL, NULL, NULL,          fd->inode,      NULL)
-DFC_MANAGE(lookup,       true,  NULL, NULL, NULL,          loc->parent,    NULL)
+DFC_MANAGE(lookup,       true,  NULL, loc,  NULL,          loc->parent,    NULL)
 DFC_MANAGE(mkdir,        false, NULL, NULL, NULL,          loc->parent,    NULL)
 DFC_MANAGE(mknod,        false, NULL, NULL, NULL,          loc->parent,    NULL)
 DFC_MANAGE(open,         true,  NULL, NULL, NULL,          loc->inode,     NULL)
@@ -2014,278 +2170,75 @@ DFC_MANAGE(writev,       false, fd,   NULL, fd->inode,     fd->inode,      NULL)
 DFC_MANAGE(xattrop,      false, NULL, NULL, NULL,          loc->inode,     NULL)
 DFC_MANAGE(fxattrop,     false, NULL, NULL, NULL,          fd->inode,      NULL)
 
-#define DFC_FOP(_fop) \
+#define DFC_FOP(_fop, _size) \
     static int32_t dfc_##_fop(call_frame_t * frame, xlator_t * xl, \
                               SYS_ARGS_DECL((SYS_GF_ARGS_##_fop))) \
     { \
-        uuid_t uuid; \
-        int64_t txn; \
-        off_t aux_offs; \
-        size_t aux_size; \
-        dfc_manager_t * dfc = xl->private; \
         logT("DFC(" #_fop ")"); \
-        err_t error = dfc_analyze(dfc, &xdata, uuid, &txn, \
-                                  NULL, NULL, &aux_offs, &aux_size); \
-        if (error == ENOENT) \
+        if (_size != 0) \
         { \
-            sys_gf_##_fop##_wind_tail(frame, FIRST_CHILD(xl), \
-                                      SYS_ARGS_NAMES((SYS_GF_ARGS_##_fop))); \
-            return 0; \
-        } \
-        if (error == 0) \
-        { \
-            logT("DFC(" #_fop ") managed"); \
-            SYS_ASYNC( \
-                dfc_managed_##_fop, (dfc, frame, xl, uuid, txn, aux_offs, \
-                                     aux_size, \
-                                     SYS_ARGS_NAMES((SYS_GF_ARGS_##_fop))) \
+            sys_dict_acquire(&xdata, xdata); \
+            SYS_CALL( \
+                sys_dict_set_uint64, (&xdata, DFC_XATTR_VSIZE, 0, NULL), \
+                E(), \
+                GOTO(failed) \
             ); \
-            return 0; \
         } \
-        sys_gf_##_fop##_unwind_error(frame, EUCLEAN, NULL); \
+        SYS_ASYNC( \
+            dfc_managed_##_fop, (frame, xl, \
+                                 SYS_ARGS_NAMES((SYS_GF_ARGS_##_fop))) \
+        ); \
+        if (_size != 0) \
+        { \
+            sys_dict_release(xdata); \
+        } \
+        return 0; \
+    failed: \
+        sys_gf_##_fop##_unwind_error(frame, EIO, NULL); \
         return 0; \
     }
 
-static int32_t dfc_readdir(call_frame_t * frame, xlator_t * xl,
-                           SYS_ARGS_DECL((SYS_GF_ARGS_readdir)))
-{
-    uuid_t uuid;
-    int64_t txn;
-    off_t aux_offs;
-    size_t aux_size;
-    dfc_manager_t * dfc = xl->private;
-    logT("DFC(readdir)");
-    err_t error = dfc_analyze(dfc, &xdata, uuid, &txn,
-                              NULL, NULL, &aux_offs, &aux_size);
-    if (error == ENOENT)
-    {
-        sys_gf_readdir_wind_tail(frame, FIRST_CHILD(xl),
-                                 SYS_ARGS_NAMES((SYS_GF_ARGS_readdir)));
-        return 0;
-    }
-    if (error == 0)
-    {
-        logT("DFC(readdir) managed");
-        sys_dict_acquire(&xdata, xdata);
-        SYS_CALL(
-            sys_dict_set_uint64, (&xdata, DFC_XATTR_SIZE, 0, NULL),
-            E(),
-            GOTO(failed)
-        );
-        SYS_ASYNC(
-            dfc_managed_readdir, (dfc, frame, xl, uuid, txn, aux_offs,
-                                  aux_size,
-                                  SYS_ARGS_NAMES((SYS_GF_ARGS_readdir)))
-        );
-        sys_dict_release(xdata);
-
-        return 0;
-    }
-
-    sys_gf_readdir_unwind_error(frame, EUCLEAN, NULL);
-
-    return 0;
-
-failed:
-    sys_gf_readdir_unwind_error(frame, EIO, NULL);
-
-    return 0;
-}
-
-static int32_t dfc_readdirp(call_frame_t * frame, xlator_t * xl,
-                            SYS_ARGS_DECL((SYS_GF_ARGS_readdirp)))
-{
-    uuid_t uuid;
-    int64_t txn;
-    off_t aux_offs;
-    size_t aux_size;
-    dfc_manager_t * dfc = xl->private;
-    logT("DFC(readdirp)");
-    err_t error = dfc_analyze(dfc, &xdata, uuid, &txn,
-                              NULL, NULL, &aux_offs, &aux_size);
-    if (error == ENOENT)
-    {
-        sys_gf_readdirp_wind_tail(frame, FIRST_CHILD(xl),
-                                  SYS_ARGS_NAMES((SYS_GF_ARGS_readdirp)));
-        return 0;
-    }
-    if (error == 0)
-    {
-        logT("DFC(readdirp) managed");
-        sys_dict_acquire(&xdata, xdata);
-        SYS_CALL(
-            sys_dict_set_uint64, (&xdata, DFC_XATTR_SIZE, 0, NULL),
-            E(),
-            GOTO(failed)
-        );
-        SYS_ASYNC(
-            dfc_managed_readdirp, (dfc, frame, xl, uuid, txn, aux_offs,
-                                   aux_size,
-                                   SYS_ARGS_NAMES((SYS_GF_ARGS_readdirp)))
-        );
-        sys_dict_release(xdata);
-
-        return 0;
-    }
-
-    sys_gf_readdirp_unwind_error(frame, EUCLEAN, NULL);
-
-    return 0;
-
-failed:
-    sys_gf_readdirp_unwind_error(frame, EIO, NULL);
-
-    return 0;
-}
-
-static int32_t dfc_lookup(call_frame_t * frame, xlator_t * xl,
-                          SYS_ARGS_DECL((SYS_GF_ARGS_lookup)))
-{
-    uuid_t uuid;
-    int64_t txn;
-    off_t aux_offs;
-    size_t size, aux_size;
-    dfc_manager_t * dfc = xl->private;
-    void * sort = NULL;
-    logT("DFC(lookup)");
-    err_t error = dfc_analyze(dfc, &xdata, uuid, &txn, &sort, &size,
-                              &aux_offs, &aux_size);
-
-    if (error == ENOENT)
-    {
-        sys_gf_lookup_wind_tail(frame, FIRST_CHILD(xl),
-                                SYS_ARGS_NAMES((SYS_GF_ARGS_lookup)));
-        return 0;
-    }
-    if (error == 0)
-    {
-        if (sort == NULL)
-        {
-            logT("DFC(lookup) managed");
-            sys_dict_acquire(&xdata, xdata);
-            SYS_CALL(
-                sys_dict_set_uint64, (&xdata, DFC_XATTR_SIZE, 0, NULL),
-                E(),
-                GOTO(failed)
-            );
-            SYS_ASYNC(
-                dfc_managed_lookup, (dfc, frame, xl, uuid, txn, aux_offs,
-                                     aux_size,
-                                     SYS_ARGS_NAMES((SYS_GF_ARGS_lookup)))
-            );
-            sys_dict_release(xdata);
-            return 0;
-        }
-        if ((loc->name == NULL) && (strcmp(loc->path, "/") == 0))
-        {
-            logT("DFC(lookup) init");
-            SYS_FREE(sort);
-            SYS_ASYNC(
-                dfc_init_handler, (dfc, frame, xl, uuid, txn,
-                                   SYS_ARGS_NAMES((SYS_GF_ARGS_lookup)))
-            );
-            return 0;
-        }
-    }
-
-    sys_gf_lookup_unwind_error(frame, EUCLEAN, NULL);
-
-    return 0;
-
-failed:
-    sys_gf_lookup_unwind_error(frame, EIO, NULL);
-
-    return 0;
-}
-
-static int32_t dfc_getxattr(call_frame_t * frame, xlator_t * xl,
-                            SYS_ARGS_DECL((SYS_GF_ARGS_getxattr)))
-{
-    uuid_t uuid;
-    int64_t txn;
-    off_t aux_offs;
-    size_t size, aux_size;
-    dfc_manager_t * dfc = xl->private;
-    void * sort = NULL;
-    logT("DFC(getxattr)");
-    if (xdata != NULL)
-    {
-        dict_foreach(xdata, __dump_xdata, NULL);
-    }
-    err_t error = dfc_analyze(dfc, &xdata, uuid, &txn, &sort, &size,
-                              &aux_offs, &aux_size);
-
-    if (error == ENOENT)
-    {
-        sys_gf_getxattr_wind_tail(frame, FIRST_CHILD(xl),
-                                  SYS_ARGS_NAMES((SYS_GF_ARGS_getxattr)));
-        return 0;
-    }
-    if (error == 0)
-    {
-        if (sort == NULL)
-        {
-            logT("DFC(getxattr) managed");
-            SYS_ASYNC(
-                dfc_managed_getxattr, (dfc, frame, xl, uuid, txn, aux_offs,
-                                       aux_size,
-                                       SYS_ARGS_NAMES((SYS_GF_ARGS_getxattr)))
-            );
-            return 0;
-        }
-        if ((loc->name == NULL) && (strcmp(loc->path, "/") == 0))
-        {
-            logT("DFC(getxattr) sort");
-//            logI("Going to handle %p", frame);
-            SYS_ASYNC(dfc_sort_handler, (dfc, frame, xl, uuid, txn, sort,
-                                         size));
-            return 0;
-        }
-        SYS_FREE(sort);
-    }
-
-    sys_gf_getxattr_unwind_error(frame, EUCLEAN, NULL);
-
-    return 0;
-}
-
-DFC_FOP(access)
-DFC_FOP(create)
-DFC_FOP(entrylk)
-DFC_FOP(fentrylk)
-DFC_FOP(flush)
-DFC_FOP(fsync)
-DFC_FOP(fsyncdir)
-DFC_FOP(fgetxattr)
-DFC_FOP(inodelk)
-DFC_FOP(finodelk)
-DFC_FOP(link)
-DFC_FOP(lk)
-DFC_FOP(mkdir)
-DFC_FOP(mknod)
-DFC_FOP(open)
-DFC_FOP(opendir)
-DFC_FOP(rchecksum)
-DFC_FOP(readlink)
-DFC_FOP(readv)
-DFC_FOP(removexattr)
-DFC_FOP(fremovexattr)
-DFC_FOP(rename)
-DFC_FOP(rmdir)
-DFC_FOP(setattr)
-DFC_FOP(fsetattr)
-DFC_FOP(setxattr)
-DFC_FOP(fsetxattr)
-DFC_FOP(stat)
-DFC_FOP(fstat)
-DFC_FOP(statfs)
-DFC_FOP(symlink)
-DFC_FOP(truncate)
-DFC_FOP(ftruncate)
-DFC_FOP(unlink)
-DFC_FOP(writev)
-DFC_FOP(xattrop)
-DFC_FOP(fxattrop)
+DFC_FOP(access,       0)
+DFC_FOP(create,       0)
+DFC_FOP(entrylk,      0)
+DFC_FOP(fentrylk,     0)
+DFC_FOP(flush,        0)
+DFC_FOP(fsync,        0)
+DFC_FOP(fsyncdir,     0)
+DFC_FOP(getxattr,     0)
+DFC_FOP(fgetxattr,    0)
+DFC_FOP(inodelk,      0)
+DFC_FOP(finodelk,     0)
+DFC_FOP(link,         0)
+DFC_FOP(lk,           0)
+DFC_FOP(lookup,       1)
+DFC_FOP(mkdir,        0)
+DFC_FOP(mknod,        0)
+DFC_FOP(open,         0)
+DFC_FOP(opendir,      0)
+DFC_FOP(rchecksum,    0)
+DFC_FOP(readlink,     0)
+DFC_FOP(readdir,      1)
+DFC_FOP(readdirp,     1)
+DFC_FOP(readv,        0)
+DFC_FOP(removexattr,  0)
+DFC_FOP(fremovexattr, 0)
+DFC_FOP(rename,       0)
+DFC_FOP(rmdir,        0)
+DFC_FOP(setattr,      0)
+DFC_FOP(fsetattr,     0)
+DFC_FOP(setxattr,     0)
+DFC_FOP(fsetxattr,    0)
+DFC_FOP(stat,         0)
+DFC_FOP(fstat,        0)
+DFC_FOP(statfs,       0)
+DFC_FOP(symlink,      0)
+DFC_FOP(truncate,     0)
+DFC_FOP(ftruncate,    0)
+DFC_FOP(unlink,       0)
+DFC_FOP(writev,       0)
+DFC_FOP(xattrop,      0)
+DFC_FOP(fxattrop,     0)
 
 static int32_t dfc_forget(xlator_t * this, inode_t * inode)
 {

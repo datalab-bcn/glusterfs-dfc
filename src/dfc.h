@@ -29,6 +29,7 @@
 #define DFC_XATTR_TIME   DFC_XATTR ".time"
 #define DFC_XATTR_OFFSET DFC_XATTR ".offset"
 #define DFC_XATTR_SIZE   DFC_XATTR ".size"
+#define DFC_XATTR_VSIZE  DFC_XATTR ".virtual-size"
 
 enum dfc_mem_types
 {
