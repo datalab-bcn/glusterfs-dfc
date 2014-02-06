@@ -2094,6 +2094,7 @@ DFC_CHECK(fxattrop)
         off_t aux_offs; \
         size_t aux_size; \
         dfc_manager_t * dfc = xl->private; \
+        sys_dict_acquire(&xdata, xdata); \
         err_t error = dfc_check_##_fop(dfc, frame, xl, &xdata, uuid, &txn, \
                                        &aux_offs, &aux_size, _loc); \
         if (error != EALREADY) \
@@ -2116,15 +2117,18 @@ DFC_CHECK(fxattrop)
                 req->link2.inode = _inode3; \
                 req->refs = ((_inode2) != NULL) + ((_inode3) != NULL); \
                 SYS_LOCK(&dfc->lock, dfc_managed, (dfc, req, uuid)); \
-                return; \
             } \
-            req->client = NULL; \
-            req->link1.inode = NULL; \
-            req->link2.inode = NULL; \
-            req->refs = 0; \
-            req->bad = error != ENOENT; \
-            dfc_request_execute(req); \
+            else \
+            { \
+                req->client = NULL; \
+                req->link1.inode = NULL; \
+                req->link2.inode = NULL; \
+                req->refs = 0; \
+                req->bad = error != ENOENT; \
+                dfc_request_execute(req); \
+            } \
         } \
+        sys_dict_release(xdata); \
     } \
 
 DFC_MANAGE(access,       true,  NULL, NULL, NULL,          loc->inode,     NULL)
