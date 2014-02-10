@@ -182,21 +182,22 @@ void dfc_request_free(dfc_request_t * req)
     dfc_child_t * child;
     dfc_sort_t sort;
 
+    STACK_RESET(req->frame->root);
+
     child = req->child;
-    if ((child->count < child->dfc->max_requests) ||
-        list_empty(&child->pool))
+    if (child->active < child->dfc->requests)
+    {
+        dfc_sort_initialize(&sort);
+        __dfc_sort_send(child, &sort);
+    }
+    else if ((child->count < child->dfc->max_requests) ||
+             list_empty(&child->pool))
     {
         list_add_tail(&req->list, &child->pool);
     }
     else
     {
         dfc_request_destroy(req);
-    }
-
-    if (child->active < child->dfc->requests)
-    {
-        dfc_sort_initialize(&sort);
-        __dfc_sort_send(child, &sort);
     }
 }
 

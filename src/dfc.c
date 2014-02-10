@@ -125,7 +125,6 @@ struct _dfc_client
 struct _dfc_manager
 {
     sys_lock_t     lock;
-    call_frame_t * frame;
     uint64_t       graph;
     dfc_client_t * clients[256];
 };
@@ -1759,6 +1758,7 @@ failed:
 
 SYS_CBK_DECLARE(dfc_update_size_xattr_cbk, io,
     (
+        (call_frame_t *, frame),
         (xlator_t *,     xl),
         (loc_t,         loc, PTR,  sys_loc_acquire, sys_loc_release),
         (dfc_inode_t *, inode)
@@ -1766,28 +1766,28 @@ SYS_CBK_DECLARE(dfc_update_size_xattr_cbk, io,
 
 SYS_CBK_DECLARE(dfc_update_size_xattr_fcbk, io,
     (
+        (call_frame_t *, frame),
         (xlator_t *,     xl),
         (fd_t *,        fd,  COPY, sys_fd_acquire, sys_fd_release),
         (dfc_inode_t *, inode)
     ));
 
-void dfc_update_size_xattr(xlator_t * xl, fd_t * fd, loc_t * loc,
-                           dfc_inode_t * inode)
+void dfc_update_size_xattr(call_frame_t * frame, xlator_t * xl, fd_t * fd,
+                           loc_t * loc, dfc_inode_t * inode)
 {
-    dfc_manager_t * dfc;
     dict_t * dict;
     size_t new_size;
 
     new_size = inode->new_size;
     if (inode->size == new_size)
     {
-        return;
+        goto done;
     }
 
     if (!atomic_cmpxchg(&inode->update_size, -1ULL, new_size,
                         memory_order_seq_cst, memory_order_seq_cst))
     {
-        return;
+        goto done;
     }
 
     dict = NULL;
@@ -1797,22 +1797,34 @@ void dfc_update_size_xattr(xlator_t * xl, fd_t * fd, loc_t * loc,
         GOTO(failed)
     );
 
-    dfc = xl->private;
+    if (frame == NULL)
+    {
+        SYS_PTR(
+            &frame, create_frame, (xl, xl->ctx->pool),
+            ENOMEM,
+            E(),
+            GOTO(failed_dict)
+        );
+    }
+    else
+    {
+        STACK_RESET(frame->root);
+    }
 
     if (fd == NULL)
     {
         SYS_IO(
-            sys_gf_setxattr_wind, (dfc->frame, NULL, FIRST_CHILD(xl), loc,
-                                   dict, 0, NULL),
-            SYS_CBK(dfc_update_size_xattr_cbk, (xl, loc, inode))
+            sys_gf_setxattr_wind, (frame, NULL, FIRST_CHILD(xl), loc, dict,
+                                   0, NULL),
+            SYS_CBK(dfc_update_size_xattr_cbk, (frame, xl, loc, inode))
         );
     }
     else
     {
         SYS_IO(
-            sys_gf_fsetxattr_wind, (dfc->frame, NULL, FIRST_CHILD(xl), fd,
-                                    dict, 0, NULL),
-            SYS_CBK(dfc_update_size_xattr_fcbk, (xl, fd, inode))
+            sys_gf_fsetxattr_wind, (frame, NULL, FIRST_CHILD(xl), fd, dict,
+                                    0, NULL),
+            SYS_CBK(dfc_update_size_xattr_fcbk, (frame, xl, fd, inode))
         );
     }
 
@@ -1820,12 +1832,20 @@ void dfc_update_size_xattr(xlator_t * xl, fd_t * fd, loc_t * loc,
 
     return;
 
+failed_dict:
+    sys_dict_release(dict);
 failed:
     inode->size = -1;
+done:
+    if (frame != NULL)
+    {
+        STACK_DESTROY(frame->root);
+    }
 }
 
 SYS_CBK_DEFINE(dfc_update_size_xattr_cbk, io,
     (
+        (call_frame_t *, frame),
         (xlator_t *,     xl),
         (loc_t,          loc, PTR,  sys_loc_acquire, sys_loc_release),
         (dfc_inode_t *,  inode)
@@ -1834,11 +1854,12 @@ SYS_CBK_DEFINE(dfc_update_size_xattr_cbk, io,
 {
     inode->size = inode->update_size;
     atomic_store(&inode->update_size, -1, memory_order_seq_cst);
-    dfc_update_size_xattr(xl, NULL, loc, inode);
+    dfc_update_size_xattr(frame, xl, NULL, loc, inode);
 }
 
 SYS_CBK_DEFINE(dfc_update_size_xattr_fcbk, io,
     (
+        (call_frame_t *, frame),
         (xlator_t *,     xl),
         (fd_t *,         fd,  COPY, sys_fd_acquire, sys_fd_release),
         (dfc_inode_t *,  inode)
@@ -1847,7 +1868,7 @@ SYS_CBK_DEFINE(dfc_update_size_xattr_fcbk, io,
 {
     inode->size = inode->update_size;
     atomic_store(&inode->update_size, -1, memory_order_seq_cst);
-    dfc_update_size_xattr(xl, fd, NULL, inode);
+    dfc_update_size_xattr(frame, xl, fd, NULL, inode);
 }
 
 #define DFC_UPDATE(_fop, _inode, _pre, _post) \
@@ -1868,7 +1889,8 @@ SYS_CBK_DEFINE(dfc_update_size_xattr_fcbk, io,
             inode = dfc_size_update(req, &args->xdata); \
             if (inode != NULL) \
             { \
-                dfc_update_size_xattr(req->xl, req->fd, &req->loc, inode); \
+                dfc_update_size_xattr(NULL, req->xl, req->fd, &req->loc, \
+                                      inode); \
             } \
             psize = SYS_SELECT(&args->_post.ia_size, NULL, _post); \
             if (psize != NULL) \
@@ -2302,13 +2324,6 @@ int32_t init(xlator_t * this)
         GOTO(failed, &error)
     );
 
-    SYS_PTR(
-        &dfc->frame, create_frame, (this, this->ctx->pool),
-        ENOMEM,
-        E(),
-        GOTO(failed_dfc, &error)
-    );
-
     sys_lock_initialize(&dfc->lock);
 /*
     SYS_CALL(
@@ -2323,8 +2338,6 @@ int32_t init(xlator_t * this)
 
     return 0;
 
-failed_dfc:
-    SYS_FREE(dfc);
 failed:
     logE("The Distributed FOP Coordinator translator could not start. "
          "Error %d", error);
@@ -2341,7 +2354,6 @@ void fini(xlator_t * this)
     dfc = this->private;
     this->private = NULL;
 
-    STACK_DESTROY(dfc->frame->root);
     SYS_FREE(dfc);
 }
 
