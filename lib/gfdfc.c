@@ -165,15 +165,22 @@ void dfc_request_free(dfc_request_t * req)
     STACK_RESET(req->frame->root);
 
     child = req->child;
-    if (child->active < child->dfc->requests)
+    if (child->state == DFC_CHILD_UP)
     {
-        dfc_sort_initialize(&sort);
-        __dfc_sort_send(child, &sort);
-    }
-    else if ((child->count < child->dfc->max_requests) ||
-             list_empty(&child->pool))
-    {
-        list_add_tail(&req->list, &child->pool);
+        if (child->active < child->dfc->requests)
+        {
+            dfc_sort_initialize(&sort);
+            __dfc_sort_send(child, &sort);
+        }
+        else if ((child->count < child->dfc->max_requests) ||
+                 list_empty(&child->pool))
+        {
+            list_add_tail(&req->list, &child->pool);
+        }
+        else
+        {
+            dfc_request_destroy(req);
+        }
     }
     else
     {
@@ -459,20 +466,30 @@ SYS_CBK_CREATE(dfc_sort_recv, data, ((dfc_t *, dfc), (dfc_request_t *, req)))
 //        dict_foreach(args->dict, __xdata_dump, NULL);
 //    }
 
-    sort = &req->sort;
-    sort->head = sort->data;
-    sort->size = sizeof(sort->data);
-    SYS_CALL(
-        sys_dict_get_bin, (args->dict, DFC_XATTR_SORT, sort->data,
-                           &sort->size),
-        T(),
-        GOTO(done)
-    );
+    if (args->op_ret >= 0)
+    {
+        sort = &req->sort;
+        sort->head = sort->data;
+        sort->size = sizeof(sort->data);
+        SYS_CALL(
+            sys_dict_get_bin, (args->dict, DFC_XATTR_SORT, sort->data,
+                               &sort->size),
+            T(),
+            GOTO(done)
+        );
 
-    SYS_CALL(
-        dfc_sort_process, (dfc, req->child, sort),
-        E()
-    );
+        SYS_CALL(
+            dfc_sort_process, (dfc, req->child, sort),
+            E()
+        );
+    }
+    else
+    {
+        if (args->op_errno == ENOTCONN)
+        {
+            dfc_stop(dfc, req->child->xl);
+        }
+    }
 
 done:
     dfc_request_free(req);
