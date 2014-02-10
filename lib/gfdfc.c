@@ -80,55 +80,35 @@ err_t dfc_sort_create(dfc_sort_t ** sort)
 err_t __dfc_attach(dfc_t * dfc, int64_t id, void * data, size_t size,
                    dict_t ** xdata)
 {
-    dict_t * aux;
-    err_t error;
-
-    aux = *xdata;
-
     SYS_CALL(
-        sys_dict_set_uuid, (&aux, DFC_XATTR_UUID, dfc->uuid, NULL),
+        sys_dict_set_uuid, (xdata, DFC_XATTR_UUID, dfc->uuid, NULL),
         E(),
         RETERR()
     );
 
     SYS_CALL(
-        sys_dict_set_int64, (&aux, DFC_XATTR_ID, id, NULL),
+        sys_dict_set_int64, (xdata, DFC_XATTR_ID, id, NULL),
         E(),
-        GOTO(failed, &error)
+        RETERR()
     );
 
     if (data != NULL)
     {
         SYS_CALL(
-            sys_dict_set_bin, (&aux, DFC_XATTR_SORT, data, size, NULL),
+            sys_dict_set_bin, (xdata, DFC_XATTR_SORT, data, size, NULL),
             E(),
-            GOTO(failed, &error)
+            RETERR()
         );
     }
 
-    if (*xdata == aux)
-    {
-        sys_dict_acquire(xdata, aux);
-    }
-    else
-    {
-        *xdata = aux;
-    }
 /*
     SYS_CALL(
-        sys_dict_set_int64, (&aux, DFC_XATTR_TIME, time),
+        sys_dict_set_int64, (xdata, DFC_XATTR_TIME, time),
         E(),
-        GOTO(failed, &error)
+        RETERR()
     );
 */
     return 0;
-
-failed:
-    if (*xdata == NULL)
-    {
-        sys_dict_release(aux);
-    }
-    return error;
 }
 
 void dfc_request_destroy(dfc_request_t * req)
