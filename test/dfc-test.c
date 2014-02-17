@@ -59,6 +59,7 @@ failed:
         dfc_transaction_t * txn; \
         xlator_list_t * list; \
         int32_t num_childs; \
+        sys_dict_acquire(&xdata, xdata); \
         SYS_CALL( \
             dfc_test_txn, (xl->private, &xdata, &txn), \
             E(), \
@@ -76,6 +77,7 @@ failed:
         sys_dict_release(xdata); \
         return; \
     failed: \
+        sys_dict_release(xdata); \
         SYS_IO(sys_gf_##_fop##_unwind_error, (frame, EIO, NULL), NULL, NULL); \
     } \
     static int32_t dfc_test_##_fop(call_frame_t * frame, xlator_t * xl, \
