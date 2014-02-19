@@ -1361,7 +1361,7 @@ void __dfc_serialize(dfc_client_t * client, dfc_request_t * req)
 //    logI("Current: %ld(%ld), next_txn: %ld, next_seq: %ld, next_receive: %lu",
 //         req->txn, req->seq, client->next_txn, client->next_seq,
 //         client->next_receive);
-    while (client->next_receive == req->seq)
+    while (client->next_receive == (req->seq & INT64_MAX))
     {
         if (!req->sorted)
         {
@@ -1376,7 +1376,11 @@ void __dfc_serialize(dfc_client_t * client, dfc_request_t * req)
         list_del_init(&req->ready_pending_list);
         list_del_init(&req->sequence_list);
 
-        client->next_receive++;
+        if ((req->seq & INT64_MIN) == 0)
+        {
+            client->next_receive++;
+        }
+
         sort = req->sort;
         if (!sys_delay_cancel(req->delay, false))
         {
@@ -1578,7 +1582,7 @@ SYS_LOCK_CREATE(dfc_sort_client_add, ((dfc_request_t *, req)))
         do
         {
             tmp = list_entry(item, dfc_request_t, sequence_list);
-            if (tmp->seq < req->seq)
+            if ((tmp->seq & INT64_MAX) < (req->seq & INT64_MAX))
             {
                 break;
             }
@@ -1599,10 +1603,6 @@ SYS_LOCK_CREATE(dfc_sort_client_add, ((dfc_request_t *, req)))
                 break;
             }
             req = list_entry(item, dfc_request_t, sequence_list);
-            if (req->seq != seq)
-            {
-                break;
-            }
         } while (req->seq == seq);
         client->next_seq = seq;
     }

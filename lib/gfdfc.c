@@ -204,14 +204,16 @@ void dfc_transaction_destroy(dfc_transaction_t * txn)
     SYS_FREE(txn);
 }
 
-err_t dfc_transaction_create(dfc_t * dfc, uint64_t mask,
+err_t dfc_transaction_create(dfc_t * dfc, uint64_t mask, dict_t * xdata,
                              dfc_transaction_t ** txn)
 {
     dfc_transaction_t * tmp, * aux;
     dfc_child_t * child;
     struct list_head * item;
-    int64_t id;
+    int64_t id, txn_ids[2];
+    size_t len;
     int32_t i;
+    err_t error;
 
     SYS_ALLOC(
         &tmp,
@@ -227,29 +229,66 @@ err_t dfc_transaction_create(dfc_t * dfc, uint64_t mask,
 
     sys_mutex_lock(&dfc->lock);
 
-    tmp->id = ++dfc->current_txn;
-    i = 0;
-    list_for_each_entry(child, &dfc->children, list)
+    len = sizeof(txn_ids);
+    if (sys_dict_get_bin(xdata, DFC_XATTR_ID, txn_ids, &len) == 0)
     {
-        if (mask & 1)
+        SYS_TEST(
+            len == sizeof(txn_ids),
+            EINVAL,
+            E(),
+            GOTO(failed, &error)
+        );
+        tmp->id = ntoh64(txn_ids[0]);
+        id = tmp->id & dfc->txn_mask;
+        item = dfc->txns[id].next;
+        aux = NULL;
+        while (item != &dfc->txns[id])
         {
-            tmp->seqs[i] = ++child->seq;
+            aux = list_entry(item, dfc_transaction_t, list);
+            if (aux->id >= tmp->id)
+            {
+                break;
+            }
+            item = item->next;
         }
-        else
+        SYS_TEST(
+            (aux != NULL) && (aux->id <= tmp->id),
+            ENOENT,
+            E(),
+            GOTO(failed, &error)
+        );
+        for (i = 0; i < dfc->count; i++)
         {
-            tmp->seqs[i] = -1;
+            tmp->seqs[i] = aux->seqs[i] | INT64_MIN;
         }
-        i++;
-        mask >>= 1;
     }
-    id = tmp->id & dfc->txn_mask;
-    item = dfc->txns[id].prev;
-    while (item != &dfc->txns[id])
+    else
     {
-        aux = list_entry(item, dfc_transaction_t, list);
-        if (aux->id < tmp->id)
+        tmp->id = ++dfc->current_txn;
+        i = 0;
+        list_for_each_entry(child, &dfc->children, list)
         {
-            break;
+            if (mask & 1)
+            {
+                tmp->seqs[i] = ++child->seq;
+            }
+            else
+            {
+                tmp->seqs[i] = -1;
+            }
+            i++;
+            mask >>= 1;
+        }
+
+        id = tmp->id & dfc->txn_mask;
+        item = dfc->txns[id].prev;
+        while (item != &dfc->txns[id])
+        {
+            aux = list_entry(item, dfc_transaction_t, list);
+            if (aux->id < tmp->id)
+            {
+                break;
+            }
         }
     }
     list_add_tail(&tmp->list, item);
@@ -264,6 +303,11 @@ err_t dfc_transaction_create(dfc_t * dfc, uint64_t mask,
     *txn = tmp;
 
     return 0;
+
+failed:
+    SYS_FREE(tmp);
+
+    return error;
 }
 
 err_t dfc_sort_update(dfc_t * dfc, dfc_sort_t * sort, uuid_t uuid, int64_t txn)
@@ -982,12 +1026,13 @@ int32_t dfc_default_notify(dfc_t * dfc, xlator_t * xl, int32_t event,
     return 0;
 }
 
-err_t dfc_begin(dfc_t * dfc, uint64_t mask, dfc_transaction_t ** txn)
+err_t dfc_begin(dfc_t * dfc, uint64_t mask, dict_t * xdata,
+                dfc_transaction_t ** txn)
 {
     dfc_transaction_t * tmp;
 
     SYS_CALL(
-        dfc_transaction_create, (dfc, mask, &tmp),
+        dfc_transaction_create, (dfc, mask, xdata, &tmp),
         E(),
         RETERR()
     );

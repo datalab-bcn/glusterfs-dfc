@@ -39,7 +39,8 @@ static int32_t child_count;
         xlator_list_t * list; \
         int32_t idx; \
         SYS_CALL( \
-            dfc_begin, (xl->private, (1ULL << child_count) - 1ULL, &txn), \
+            dfc_begin, (xl->private, (1ULL << child_count) - 1ULL, xdata, \
+                        &txn), \
             E(), \
             GOTO(failed) \
         ); \
