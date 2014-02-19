@@ -21,28 +21,7 @@
 #include "gfsys.h"
 #include "gfdfc.h"
 
-err_t dfc_test_txn(dfc_t * dfc, dict_t ** xdata, dfc_transaction_t ** txn)
-{
-    err_t error;
-
-    SYS_CALL(
-        dfc_begin, (dfc, txn),
-        E(),
-        RETERR()
-    );
-    SYS_CALL(
-        dfc_attach, (*txn, xdata),
-        E(),
-        GOTO(failed, &error)
-    );
-
-    return 0;
-
-failed:
-    dfc_end(*txn, 0);
-
-    return error;
-}
+static int32_t child_count;
 
 #define DFC_TEST_FOP(_fop) \
     SYS_CBK_CREATE(__dfc_test_##_fop##_cbk, io, ((dfc_transaction_t *, txn))) \
@@ -58,26 +37,33 @@ failed:
     { \
         dfc_transaction_t * txn; \
         xlator_list_t * list; \
-        int32_t num_childs; \
-        sys_dict_acquire(&xdata, xdata); \
+        int32_t idx; \
         SYS_CALL( \
-            dfc_test_txn, (xl->private, &xdata, &txn), \
+            dfc_begin, (xl->private, (1ULL << child_count) - 1ULL, &txn), \
             E(), \
             GOTO(failed) \
         ); \
-        num_childs = 0; \
+        idx = 0; \
         for (list = xl->children; list != NULL; list = list->next) \
         { \
+            sys_dict_acquire(&xdata, xdata); \
+            SYS_CALL(\
+                dfc_attach, (txn, idx, &xdata), \
+                E(), \
+                GOTO(failed_txn) \
+            ); \
             SYS_IO(sys_gf_##_fop##_wind, (frame, NULL, list->xlator, \
                                        SYS_ARGS_NAMES((SYS_GF_ARGS_##_fop))), \
                    SYS_CBK(__dfc_test_##_fop##_cbk, (txn)), NULL); \
-            num_childs++; \
+            idx++; \
+            sys_dict_release(xdata); \
         } \
-        dfc_end(txn, num_childs); \
-        sys_dict_release(xdata); \
+        dfc_end(txn, child_count); \
         return; \
-    failed: \
+    failed_txn: \
         sys_dict_release(xdata); \
+        dfc_end(txn, 0); \
+    failed: \
         SYS_IO(sys_gf_##_fop##_unwind_error, (frame, EIO, NULL), NULL, NULL); \
     } \
     static int32_t dfc_test_##_fop(call_frame_t * frame, xlator_t * xl, \
@@ -206,8 +192,6 @@ static int32_t dfc_test_releasedir(xlator_t * xl, fd_t * fd)
 {
     return 0;
 }
-
-static int32_t child_count;
 
 int32_t notify(xlator_t * this, int32_t event, void * data, ...)
 {

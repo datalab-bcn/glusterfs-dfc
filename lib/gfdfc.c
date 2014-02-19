@@ -77,17 +77,22 @@ err_t dfc_sort_create(dfc_sort_t ** sort)
     return 0;
 }
 
-err_t __dfc_attach(dfc_t * dfc, int64_t id, void * data, size_t size,
-                   dict_t ** xdata)
+err_t __dfc_attach(dfc_t * dfc, int64_t id, int64_t seq, void * data,
+                   size_t size, dict_t ** xdata)
 {
+    int64_t txn_ids[2];
+
     SYS_CALL(
         sys_dict_set_uuid, (xdata, DFC_XATTR_UUID, dfc->uuid, NULL),
         E(),
         RETERR()
     );
 
+    txn_ids[0] = hton64(id);
+    txn_ids[1] = hton64(seq);
     SYS_CALL(
-        sys_dict_set_int64, (xdata, DFC_XATTR_ID, id, NULL),
+        sys_dict_set_bin, (xdata, DFC_XATTR_ID, txn_ids, sizeof(txn_ids),
+                           NULL),
         E(),
         RETERR()
     );
@@ -199,14 +204,19 @@ void dfc_transaction_destroy(dfc_transaction_t * txn)
     SYS_FREE(txn);
 }
 
-err_t dfc_transaction_create(dfc_t * dfc, dfc_transaction_t ** txn)
+err_t dfc_transaction_create(dfc_t * dfc, uint64_t mask,
+                             dfc_transaction_t ** txn)
 {
     dfc_transaction_t * tmp, * aux;
+    dfc_child_t * child;
     struct list_head * item;
     int64_t id;
+    int32_t i;
 
-    SYS_MALLOC(
-        &tmp, gfdfc_mt_dfc_transaction_t,
+    SYS_ALLOC(
+        &tmp,
+        sizeof(dfc_transaction_t) + dfc->count * sizeof(uint64_t),
+        gfdfc_mt_dfc_transaction_t,
         E(),
         RETERR()
     );
@@ -217,7 +227,21 @@ err_t dfc_transaction_create(dfc_t * dfc, dfc_transaction_t ** txn)
 
     sys_mutex_lock(&dfc->lock);
 
-    tmp->id = dfc->current_txn++;
+    tmp->id = ++dfc->current_txn;
+    i = 0;
+    list_for_each_entry(child, &dfc->children, list)
+    {
+        if (mask & 1)
+        {
+            tmp->seqs[i] = ++child->seq;
+        }
+        else
+        {
+            tmp->seqs[i] = -1;
+        }
+        i++;
+        mask >>= 1;
+    }
     id = tmp->id & dfc->txn_mask;
     item = dfc->txns[id].prev;
     while (item != &dfc->txns[id])
@@ -369,7 +393,7 @@ failed_lock:
 
     if ((atomic_dec(&txn->state, memory_order_seq_cst) & 0xFFFF) == 1)
     {
-//        logI("Sending sort info for %ld", num);
+//        logI("Sending sort info for %ld to %lX", num, txn->mask);
         dfc_request_send(txn->dfc, txn->mask, txn->sort.data,
                          sizeof(txn->sort.data) - txn->sort.size);
     }
@@ -518,7 +542,7 @@ err_t __dfc_sort_send(dfc_child_t * child, dfc_sort_t * sort)
 
     xdata = NULL;
     SYS_CALL(
-        __dfc_attach, (child->dfc, child->seq, sort->data,
+        __dfc_attach, (child->dfc, 0, child->seq, sort->data,
                        sizeof(sort->data) - sort->size, &xdata),
         E(),
         LOG(E(), "Failed to prepare a DFC sort request."),
@@ -881,7 +905,7 @@ SYS_ASYNC_CREATE(__dfc_start, ((dfc_t *, dfc), (xlator_t *, xl)))
                 dfc_sort_initialize(&sort);
                 xdata = NULL;
                 SYS_CALL(
-                    __dfc_attach, (dfc, child->seq, sort.data,
+                    __dfc_attach, (dfc, 0, child->seq, sort.data,
                                    sizeof(sort.data) - sort.size, &xdata),
                     E(),
                     LOG(E(), "Failed to prepare a DFC sort request."),
@@ -958,12 +982,12 @@ int32_t dfc_default_notify(dfc_t * dfc, xlator_t * xl, int32_t event,
     return 0;
 }
 
-err_t dfc_begin(dfc_t * dfc, dfc_transaction_t ** txn)
+err_t dfc_begin(dfc_t * dfc, uint64_t mask, dfc_transaction_t ** txn)
 {
     dfc_transaction_t * tmp;
 
     SYS_CALL(
-        dfc_transaction_create, (dfc, &tmp),
+        dfc_transaction_create, (dfc, mask, &tmp),
         E(),
         RETERR()
     );
@@ -993,13 +1017,16 @@ void dfc_end(dfc_transaction_t * txn, uint32_t count)
     }
 }
 
-err_t dfc_attach(dfc_transaction_t * txn, dict_t ** xdata)
+err_t dfc_attach(dfc_transaction_t * txn, int32_t idx, dict_t ** xdata)
 {
-    SYS_CALL(
-        __dfc_attach, (txn->dfc, txn->id, NULL, 0, xdata),
-        E(),
-        RETERR()
-    );
+    if (txn != NULL)
+    {
+        SYS_CALL(
+            __dfc_attach, (txn->dfc, txn->id, txn->seqs[idx], NULL, 0, xdata),
+            E(),
+            RETERR()
+        );
+    }
 
     return 0;
 }

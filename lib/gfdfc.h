@@ -73,6 +73,7 @@ struct _dfc_transaction
     uint64_t         mask;
     uint32_t         state;
     dfc_sort_t       sort;
+    uint64_t         seqs[];
 };
 
 struct _dfc_child
@@ -125,8 +126,8 @@ void dfc_start(dfc_t * dfc, xlator_t * xl);
 void dfc_stop(dfc_t * dfc, xlator_t * xl);
 int32_t dfc_default_notify(dfc_t * dfc, xlator_t * xl, int32_t event,
                            void * data);
-err_t dfc_begin(dfc_t * dfc, dfc_transaction_t ** txn);
-err_t dfc_attach(dfc_transaction_t * txn, dict_t ** xdata);
+err_t dfc_begin(dfc_t * dfc, uint64_t mask, dfc_transaction_t ** txn);
+err_t dfc_attach(dfc_transaction_t * txn, int32_t idx, dict_t ** xdata);
 void dfc_end(dfc_transaction_t * txn, uint32_t count);
 bool dfc_complete(dfc_transaction_t * txn);
 
