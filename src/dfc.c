@@ -915,6 +915,14 @@ SYS_ASYNC_CREATE(dfc_link_execute, ((dfc_link_t *, link)))
     }
 }
 
+void dfc_request_free(dfc_request_t * req)
+{
+    sys_fd_release(req->fd);
+    sys_loc_release(&req->loc);
+
+    sys_gf_args_free((uintptr_t *)req);
+}
+
 SYS_LOCK_CREATE(__dfc_request_complete, ((dfc_request_t *, req)))
 {
     dfc_client_t * client;
@@ -978,11 +986,11 @@ SYS_LOCK_CREATE(__dfc_request_complete, ((dfc_request_t *, req)))
 
     if (req != NULL)
     {
-        sys_gf_args_free((uintptr_t *)req);
+        dfc_request_free(req);
     }
     if (root != NULL)
     {
-        sys_gf_args_free((uintptr_t *)root);
+        dfc_request_free(root);
     }
 }
 
@@ -998,7 +1006,7 @@ SYS_CBK_CREATE(dfc_request_complete, data, ((dfc_request_t *, req)))
     }
     else
     {
-        sys_gf_args_free((uintptr_t *)req);
+        dfc_request_free(req);
     }
 }
 
@@ -1127,7 +1135,7 @@ void dfc_request_execute(dfc_request_t * req)
                 else
                 {
                     list_del_init(&req->sibling_list);
-                    sys_gf_args_free((uintptr_t *)req);
+                    dfc_request_free(req);
                 }
             }
         }
@@ -1702,7 +1710,7 @@ failed:
     sys_gf_unwind_error(req->frame, EUCLEAN, NULL, NULL, NULL, (uintptr_t *)req,
                         (uintptr_t *)req + DFC_REQ_SIZE);
 
-    sys_gf_args_free((uintptr_t *)req);
+    dfc_request_free(req);
 }
 
 SYS_LOCK_CREATE(dfc_init_handler, ((dfc_manager_t *, dfc),
