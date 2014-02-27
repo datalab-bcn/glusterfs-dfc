@@ -39,8 +39,8 @@ static int32_t child_count;
         xlator_list_t * list; \
         int32_t idx; \
         SYS_CALL( \
-            dfc_begin, (xl->private, (1ULL << child_count) - 1ULL, xdata, \
-                        &txn), \
+            dfc_begin, (xl->private, (1ULL << child_count) - 1ULL, NULL, \
+                        xdata, &txn), \
             E(), \
             GOTO(failed) \
         ); \
@@ -59,11 +59,10 @@ static int32_t child_count;
             idx++; \
             sys_dict_release(xdata); \
         } \
-        dfc_end(txn, child_count); \
         return; \
     failed_txn: \
         sys_dict_release(xdata); \
-        dfc_end(txn, 0); \
+        dfc_failed(txn, child_count - idx); \
     failed: \
         SYS_IO(sys_gf_##_fop##_unwind_error, (frame, EIO, NULL), NULL, NULL); \
     } \

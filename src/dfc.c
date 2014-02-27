@@ -84,6 +84,8 @@ struct _dfc_request
     struct list_head sort_pending_list;
     struct list_head ready_pending_list;
     struct list_head sequence_list;
+    struct list_head sibling_list;
+    dfc_request_t *  root;
     call_frame_t *   frame;
     xlator_t *       xl;
     dfc_client_t *   client;
@@ -105,6 +107,10 @@ struct _dfc_request
     bool             ro;
     bool             bad;
     bool             sorted;
+    bool             ready;
+    bool             started;
+    bool             completed;
+    bool             fake;
 };
 
 struct _dfc_client
@@ -133,13 +139,6 @@ struct _dfc_manager
 };
 
 #define DFC_REQ_SIZE SYS_CALLS_ADJUST_SIZE(sizeof(dfc_request_t))
-
-int32_t __dump_xdata(dict_t * xdata, char * key, data_t * value, void * data)
-{
-    logT("    %s: %u", key, value->len);
-
-    return 0;
-}
 
 err_t dfc_client_get(dfc_manager_t * dfc, uuid_t uuid, dfc_client_t ** client)
 {
@@ -295,53 +294,6 @@ err_t dfc_sort_create(dfc_client_t * client)
     return 0;
 }
 
-static char dfc_hex[] = "0123456789ABCDEF";
-
-void dfc_dump(char * text, uint8_t * data, size_t size)
-{
-    uint32_t off, i;
-    char buf[80];
-
-    if (size == 0)
-    {
-        return;
-    }
-
-    logI("%s:", text);
-    buf[4] = ' ';
-    buf[5] = '|';
-    buf[54] = ' ';
-    buf[55] = '|';
-    buf[56] = ' ';
-    buf[73] = 0;
-    off = 0;
-    do
-    {
-        buf[0] = dfc_hex[off >> 24];
-        buf[1] = dfc_hex[(off >> 16) & 15];
-        buf[2] = dfc_hex[(off >> 8) & 15];
-        buf[3] = dfc_hex[off & 15];
-        off += 16;
-        for (i = 0; i < 16; i++)
-        {
-            if (size > 0)
-            {
-                size--;
-                buf[6 + i * 3] = ' ';
-                buf[7 + i * 3] = dfc_hex[*data >> 4];
-                buf[8 + i * 3] = dfc_hex[*data & 15];
-                buf[57 + i] = *data++;
-            }
-            else
-            {
-                buf[6 + i * 3] = buf[7 + i * 3] = buf[8 + i * 3] = ' ';
-                buf[57 + i] = '.';
-            }
-        }
-        logI("   %s", buf);
-    } while (size > 0);
-}
-
 err_t dfc_sort_unwind(call_frame_t * frame, dfc_sort_t * sort)
 {
     dict_t * xdata;
@@ -354,10 +306,6 @@ err_t dfc_sort_unwind(call_frame_t * frame, dfc_sort_t * sort)
         E(),
         GOTO(failed, &error)
     );
-
-//    logI("Sending sort request");
-//    dict_foreach(xdata, __dump_xdata, NULL);
-//    dfc_dump("Send", sort->data, sizeof(sort->data) - sort->size);
 
     SYS_IO(sys_gf_getxattr_unwind, (frame, 0, 0, xdata, NULL), NULL);
 
@@ -532,11 +480,8 @@ err_t dfc_link_add(xlator_t * xl, dfc_link_t * link, dfc_dependencies_t * deps)
     inode = link->inode;
     LOCK(&inode->lock);
 
-    logT("Adding %ld", link->request->txn);
-
     if ((__inode_ctx_get(inode, xl, &value) != 0) || (value == 0))
     {
-        logT("Created context");
         value = (uint64_t)(uintptr_t)link;
         SYS_CODE(
             __inode_ctx_set, (inode, xl, &value),
@@ -558,14 +503,12 @@ err_t dfc_link_add(xlator_t * xl, dfc_link_t * link, dfc_dependencies_t * deps)
             {
                 if (current->request->txn > link->request->txn)
                 {
-                    logT("Insert first");
                     list_add_tail(&link->client_list, &current->client_list);
                     list_add(&link->inode_list, &current->inode_list);
                     list_del_init(&current->inode_list);
 
                     if (current == first)
                     {
-                        logT("Replace head");
                         value = (uint64_t)(uintptr_t)link;
                         SYS_CODE(
                             __inode_ctx_set, (inode, xl, &value),
@@ -579,7 +522,6 @@ err_t dfc_link_add(xlator_t * xl, dfc_link_t * link, dfc_dependencies_t * deps)
                 }
                 else
                 {
-                    logT("Insert inside");
                     aux = list_entry(current->client_list.prev, dfc_link_t,
                                      client_list);
                     while (aux->request->txn > link->request->txn)
@@ -589,13 +531,6 @@ err_t dfc_link_add(xlator_t * xl, dfc_link_t * link, dfc_dependencies_t * deps)
                     }
                     list_add(&link->client_list, &aux->client_list);
                 }
-                aux = current;
-                do
-                {
-                    logT("-> %ld", aux->request->txn);
-                    aux = list_entry(aux->client_list.next, dfc_link_t,
-                                     client_list);
-                } while (aux != current);
                 found = true;
             }
             else
@@ -639,10 +574,8 @@ bool dfc_link_entry_allowed(dfc_link_t * link, dfc_link_t * root, uuid_t uuid,
         {
             if (req->txn <= txn)
             {
-                logT("Required transaction not executed yet (inode)");
                 if (req->bad)
                 {
-                    logW("Cascading bad request flag");
                     link->request->bad = true;
                 }
                 return false;
@@ -659,10 +592,6 @@ bool dfc_link_entry_allowed(dfc_link_t * link, dfc_link_t * root, uuid_t uuid,
     );
 
     res = (txn < client->next_txn);
-    if (!res)
-    {
-        logT("Required transaction not executed yet (client)");
-    }
 
     dfc_client_put(client);
 
@@ -740,30 +669,14 @@ int32_t dfc_link_scan(dfc_link_t * root, dfc_link_t * node, int64_t id,
     return min;
 }
 
-char * dfc_uuid(char * text, uuid_t uuid)
-{
-    sprintf(text, "%02x%02x%02x%02x-%02x%02x-%02x%02x-"
-                  "%02x%02x-%02x%02x%02x%02x%02x%02x",
-                  uuid[0], uuid[1], uuid[2], uuid[3],
-                  uuid[4], uuid[5], uuid[6], uuid[7],
-                  uuid[8], uuid[9], uuid[10], uuid[11],
-                  uuid[12], uuid[13], uuid[14], uuid[15]);
-
-    return text;
-}
-
 bool dfc_link_in_cycle(struct list_head * cycle, uuid_t uuid)
 {
     dfc_link_t * link;
-    char uuid1[48], uuid2[48];
 
     list_for_each_entry(link, cycle, cycle)
     {
         if (uuid_compare(uuid, link->request->client->uuid) == 0)
         {
-            logD("Breaking dependency from %s to %s",
-                 dfc_uuid(uuid1, link->request->client->uuid),
-                 dfc_uuid(uuid2, uuid));
             return true;
         }
     }
@@ -801,7 +714,6 @@ dfc_request_t * dfc_link_allowed(dfc_link_t * link, dfc_link_t * root)
     uint64_t graph;
     int64_t num;
     int32_t index;
-    char uuid1[48];
 
     INIT_LIST_HEAD(&cycle);
     req = link->request;
@@ -824,7 +736,6 @@ dfc_request_t * dfc_link_allowed(dfc_link_t * link, dfc_link_t * root)
                 base = ptr;
                 uuid = __sys_buf_ptr_uuid(&ptr);
                 num = __sys_buf_get_int64(&ptr);
-                logT("Evaluating %s:%lu", dfc_uuid(uuid1, *uuid), num);
 
                 if (!dfc_link_entry_allowed(link, root, *uuid, num))
                 {
@@ -838,8 +749,6 @@ dfc_request_t * dfc_link_allowed(dfc_link_t * link, dfc_link_t * root)
             } while (size > 0);
         }
 
-        logT("Remaining dependencies for %s:%lu: %lu", dfc_uuid(uuid1, req->client->uuid), req->txn, new_size);
-
         req->sort_size = new_size;
         if (new_size == 0)
         {
@@ -851,11 +760,8 @@ dfc_request_t * dfc_link_allowed(dfc_link_t * link, dfc_link_t * root)
         dfc_link_scan(root, link, graph, &index, &cycle);
         if (list_empty(&cycle))
         {
-            logT("Request delayed due to dependencies");
             return NULL;
         }
-
-        logD("Cycle detected in request dependencies of %s:%lu", dfc_uuid(uuid1, req->client->uuid), req->txn);
 
         tmp = NULL;
         list_for_each_entry(node, &cycle, cycle)
@@ -884,7 +790,7 @@ dfc_request_t * dfc_link_check(dfc_link_t * link, dfc_link_t * root)
 {
     dfc_request_t * req;
 
-    if (list_empty(&link->request->ready_pending_list))
+    if (link->request->ready)
     {
         req = dfc_link_allowed(link, root);
         if ((req != NULL) &&
@@ -892,21 +798,6 @@ dfc_request_t * dfc_link_check(dfc_link_t * link, dfc_link_t * root)
         {
             return req;
         }
-        else
-        {
-            if (req == NULL)
-            {
-                logT("Request not allowed");
-            }
-            else
-            {
-                logT("Another inode has dependencies: %d", req->refs);
-            }
-        }
-    }
-    else
-    {
-        logT("Request is not ready");
     }
 
     return NULL;
@@ -922,11 +813,8 @@ void dfc_link_del(xlator_t * xl, dfc_link_t * link)
     dfc_request_t * req = NULL;
     uint64_t value;
     inode_t * inode;
-    char uuid1[64], uuid2[64];
 
     inode = link->inode;
-//    logI("Removing request %ld(%ld) from inode %p",
-//         link->request->txn, link->request->seq, inode);
     LOCK(&inode->lock);
 
     SYS_ASSERT(
@@ -987,10 +875,6 @@ void dfc_link_del(xlator_t * xl, dfc_link_t * link)
 
     if (req != NULL)
     {
-//        logI("Dispatching request %s:%ld(%ld) after request %s:%ld(%ld)",
-//             dfc_uuid(uuid1, req->client->uuid), req->txn, req->seq,
-//             dfc_uuid(uuid2, link->request->client->uuid), link->request->txn,
-//             link->request->seq);
         dfc_request_execute(req);
     }
     else
@@ -1009,10 +893,6 @@ SYS_ASYNC_CREATE(dfc_link_execute, ((dfc_link_t *, link)))
     dfc_link_t * root;
     dfc_request_t * req = NULL;
     uint64_t value;
-    char uuid1[64];
-
-//    logI("Evaluating order of execution of %ld(%ld) on inode %p",
-//         link->request->txn, link->request->seq, link->inode);
 
     LOCK(&link->inode->lock);
 
@@ -1026,13 +906,6 @@ SYS_ASYNC_CREATE(dfc_link_execute, ((dfc_link_t *, link)))
     {
         req = dfc_link_check(link, root);
     }
-    else
-    {
-//        logI("Request is not first: root=%p (%lu(%ld)), link=%p (%lu(%lu)), "
-//             "%u", root,
-//             root->request->txn, root->request->seq, link, link->request->txn,
-//             link->request->seq, list_empty(&link->inode_list));
-    }
 
     UNLOCK(&link->inode->lock);
 
@@ -1040,59 +913,87 @@ SYS_ASYNC_CREATE(dfc_link_execute, ((dfc_link_t *, link)))
     {
         dfc_request_execute(req);
     }
-    else
-    {
-//        logI("Request %s:%ld(%ld) cannot be executed yet on inode %p",
-//             dfc_uuid(uuid1, link->request->client->uuid), link->request->txn,
-//             link->request->seq, link->inode);
-    }
 }
 
 SYS_LOCK_CREATE(__dfc_request_complete, ((dfc_request_t *, req)))
 {
     dfc_client_t * client;
-    dfc_request_t * next;
+    dfc_request_t * next, * root;
 
-    client = req->client;
-    if (req->sequence_list.next != &client->sequence)
+    req->completed = true;
+    root = req->root;
+    client = root->client;
+    if (req != root)
     {
-        next = list_entry(req->sequence_list.next, dfc_request_t,
-                          sequence_list);
-        client->next_txn = next->txn;
+        list_del_init(&req->sibling_list);
+    }
+    if (root->completed && list_empty(&root->sibling_list))
+    {
+        if ((root->seq & INT64_MIN) == 0)
+        {
+            if (root->sequence_list.next != &client->sequence)
+            {
+                next = list_entry(root->sequence_list.next, dfc_request_t,
+                                  sequence_list);
+                client->next_txn = next->txn;
+            }
+            else
+            {
+                client->next_txn += 256;
+            }
+            list_del_init(&root->sequence_list);
+
+            if (root->link1.inode != NULL)
+            {
+                dfc_link_del(root->xl, &root->link1);
+            }
+            if (root->link2.inode != NULL)
+            {
+                dfc_link_del(root->xl, &root->link2);
+            }
+            if (req == root)
+            {
+                req = NULL;
+            }
+        }
+        else
+        {
+            if (req == root)
+            {
+                req = NULL;
+            }
+            root = NULL;
+        }
     }
     else
     {
-        client->next_txn++;
+        if (req == root)
+        {
+            req = NULL;
+        }
+        root = NULL;
     }
-    list_del_init(&req->sequence_list);
 
-    if (req->link1.inode != NULL)
+    SYS_UNLOCK(&client->lock);
+
+    if (req != NULL)
     {
-        dfc_link_del(req->xl, &req->link1);
+        sys_gf_args_free((uintptr_t *)req);
     }
-    if (req->link2.inode != NULL)
+    if (root != NULL)
     {
-        dfc_link_del(req->xl, &req->link2);
+        sys_gf_args_free((uintptr_t *)root);
     }
-
-    SYS_UNLOCK(&req->client->lock);
-
-    sys_gf_args_free((uintptr_t *)req);
 }
 
 SYS_CBK_CREATE(dfc_request_complete, data, ((dfc_request_t *, req)))
 {
-    char uuid1[64];
-
     req->update(req, data);
 
     sys_gf_unwind(req->frame, 0, -1, NULL, NULL, (uintptr_t *)req, data);
 
     if (req->client != NULL)
     {
-//        logI("Completed request %s:%ld(%ld)",
-//             dfc_uuid(uuid1, req->client->uuid), req->txn, req->seq);
-
         SYS_LOCK(&req->client->lock, __dfc_request_complete, (req));
     }
     else
@@ -1111,11 +1012,9 @@ void dfc_size_save(dfc_request_t * req)
     {
         inode = (dfc_inode_t *)value;
         req->size = inode->new_size;
-        logD("DFC: pre size: size from inode: %lu", req->size);
     }
     else
     {
-        logD("DFC: pre size: no size from");
         req->size = 0;
     }
 }
@@ -1132,22 +1031,10 @@ dfc_inode_t * dfc_size_update(dfc_request_t * req, dict_t ** xdata)
     {
         inode = (dfc_inode_t *)value;
         value = inode->new_size;
-        logD("DFC: post size: size from inode: %lu", value);
-    }
-    else
-    {
-        logD("DFC: post size: no size from");
     }
 
     tmp = 0;
-    if (sys_dict_del_uint64(xdata, DFC_XATTR_VSIZE, &tmp) == 0)
-    {
-        logD("DFC: post size: size from xattr: %lu", tmp);
-    }
-    else
-    {
-        logD("DFC: post size: no size from xattr");
-    }
+    sys_dict_del_uint64(xdata, DFC_XATTR_VSIZE, &tmp);
     if (value == -1)
     {
         value = tmp;
@@ -1179,7 +1066,6 @@ dfc_inode_t * dfc_size_update(dfc_request_t * req, dict_t ** xdata)
                 tmp = req->aux_offs;
             }
 
-            logD("DFC: updating size %lu -> %lu", value, tmp);
             if (value != tmp)
             {
                 value = tmp;
@@ -1202,35 +1088,49 @@ dfc_inode_t * dfc_size_update(dfc_request_t * req, dict_t ** xdata)
 
 void dfc_request_execute(dfc_request_t * req)
 {
-    char uuid1[64];
+    struct list_head * last, * next;
+    bool bad;
 
-    if (req->client != NULL)
+    last = &req->sibling_list;
+    bad = req->bad;
+    do
     {
-//        logI("Dispatching request %s:%ld(%ld)",
-//             dfc_uuid(uuid1, req->client->uuid), req->txn, req->seq);
-    }
-    if (!req->bad)
-    {
-        dfc_size_save(req);
-        sys_gf_wind(req->frame, NULL, FIRST_CHILD(req->xl),
-                    SYS_CBK(dfc_request_complete, (req)),
-                    NULL, (uintptr_t *)req, (uintptr_t *)req + DFC_REQ_SIZE);
-    }
-    else
-    {
-        logI("Request is bad");
-        sys_gf_unwind_error(req->frame, EUCLEAN, NULL, NULL, NULL,
-                            (uintptr_t *)req, (uintptr_t *)req + DFC_REQ_SIZE);
-
-        if (req->client != NULL)
+        next = req->sibling_list.next;
+        if (!req->started)
         {
-            __dfc_request_complete(req);
+            req->started = true;
+            if (!bad && !req->fake)
+            {
+                dfc_size_save(req);
+                sys_gf_wind(req->frame, NULL, FIRST_CHILD(req->xl),
+                            SYS_CBK(dfc_request_complete, (req)),
+                            NULL, (uintptr_t *)req,
+                            (uintptr_t *)req + DFC_REQ_SIZE);
+            }
+            else
+            {
+                if (!req->fake)
+                {
+                    sys_gf_unwind_error(req->frame, EUCLEAN, NULL, NULL, NULL,
+                                        (uintptr_t *)req,
+                                        (uintptr_t *)req + DFC_REQ_SIZE);
+                }
+                if (req->client != NULL)
+                {
+                    SYS_LOCK(
+                        &req->client->lock,
+                        __dfc_request_complete, (req)
+                    );
+                }
+                else
+                {
+                    list_del_init(&req->sibling_list);
+                    sys_gf_args_free((uintptr_t *)req);
+                }
+            }
         }
-        else
-        {
-            sys_gf_args_free((uintptr_t *)req);
-        }
-    }
+        req = list_entry(next, dfc_request_t, sibling_list);
+    } while (next != last);
 }
 
 err_t dfc_request_dependencies(dfc_request_t * req, dfc_dependencies_t * deps)
@@ -1240,7 +1140,6 @@ err_t dfc_request_dependencies(dfc_request_t * req, dfc_dependencies_t * deps)
 
     if (req->link1.inode != NULL)
     {
-        logT("Checking inode1 dependencies");
         SYS_CALL(
             dfc_link_add, (req->xl, &req->link1, deps),
             E(),
@@ -1249,7 +1148,6 @@ err_t dfc_request_dependencies(dfc_request_t * req, dfc_dependencies_t * deps)
     }
     if (req->link2.inode != NULL)
     {
-        logT("Checking inode2 dependencies");
         dfc_dependency_initialize(&deps_aux, 0);
         SYS_CALL(
             dfc_link_add, (req->xl, &req->link2, &deps_aux),
@@ -1275,33 +1173,6 @@ err_t dfc_dependency_build(dfc_dependencies_t * deps, dfc_request_t * req)
                E(),
                RETERR()
            );
-}
-
-void dfc_dependency_dump(dfc_request_t * req, dfc_dependencies_t * deps)
-{
-    void * ptr;
-    uuid_t * uuid;
-    int64_t num;
-    char uuid1[48];
-
-    ptr = deps->buffer;
-    if (ptr != deps->head)
-    {
-        logT("Request %s:%lu depends on:",
-             dfc_uuid(uuid1, req->client->uuid), req->txn);
-
-        while (ptr != deps->head)
-        {
-            uuid = __sys_buf_ptr_uuid(&ptr);
-            num = __sys_buf_get_int64(&ptr);
-            logT("    %s:%lu", dfc_uuid(uuid1, *uuid), num);
-        }
-    }
-    else
-    {
-        logT("Request %s:%lu does not have dependencies",
-             dfc_uuid(uuid1, req->client->uuid), req->txn);
-    }
 }
 
 err_t dfc_request_prepare(dfc_manager_t * dfc, dfc_request_t * req,
@@ -1358,39 +1229,34 @@ void __dfc_serialize(dfc_client_t * client, dfc_request_t * req)
     struct list_head * item;
     dfc_sort_t * sort;
 
-//    logI("Current: %ld(%ld), next_txn: %ld, next_seq: %ld, next_receive: %lu",
-//         req->txn, req->seq, client->next_txn, client->next_seq,
-//         client->next_receive);
     while (client->next_receive == (req->seq & INT64_MAX))
     {
         if (!req->sorted)
         {
-//            logI("Request %ld(%ld) is not sorted", req->txn, req->seq);
             break;
         }
 
-//        logI("Going to execute transaction %ld(%ld)", req->txn, req->seq);
-
         item = req->sequence_list.next;
 
-        list_del_init(&req->ready_pending_list);
-        list_del_init(&req->sequence_list);
-
+        client->next_receive++;
         if ((req->seq & INT64_MIN) == 0)
         {
-            client->next_receive++;
+            list_del_init(&req->ready_pending_list);
+            list_del_init(&req->sequence_list);
         }
 
+        req->ready = true;
+
         sort = req->sort;
-        if (!sys_delay_cancel(req->delay, false))
+        if (!req->completed && !sys_delay_cancel(req->delay, false))
         {
-//            logI("Already cancelled");
             SYS_FREE(sort);
         }
         else
         {
             dfc_sort_client_process(req);
         }
+
         if (item == &client->sequence)
         {
             break;
@@ -1406,10 +1272,6 @@ err_t dfc_sort_parse(dfc_client_t * client, void * sort, size_t size)
     int64_t txn, idx;
     size_t bsize;
     uint32_t length;
-
-    logT("Parsing sort data: %lu", size);
-
-//    dfc_dump("Recv", sort, size);
 
     ptr = sort;
     while (size > 0)
@@ -1427,15 +1289,13 @@ err_t dfc_sort_parse(dfc_client_t * client, void * sort, size_t size)
             CONTINUE()
         );
 
-//        logI("Sort info for txn %ld", txn);
-
         req = NULL;
-        idx = txn & client->txn_mask;
+        idx = (txn >> 8) & client->txn_mask;
         if (!list_empty(&client->requests[idx]))
         {
             req = list_entry(client->requests[idx].next, dfc_request_t,
                              ready_pending_list);
-            if (req->txn != txn)
+            if (((req->txn ^ txn) >> 8) != 0)
             {
                 req = NULL;
             }
@@ -1450,7 +1310,6 @@ err_t dfc_sort_parse(dfc_client_t * client, void * sort, size_t size)
 
         if (dfc_request_prepare(client->dfc, req, data, bsize) != 0)
         {
-            logI("Failed to prepare request %ld", req->txn);
             req->bad = true;
         }
 
@@ -1466,7 +1325,7 @@ err_t dfc_sort_parse(dfc_client_t * client, void * sort, size_t size)
 
 SYS_LOCK_CREATE(dfc_sort_client_recv, ((dfc_client_t *, client),
                                        (call_frame_t *, frame),
-                                       (int64_t, txn), (void *, data),
+                                       (int64_t *, txn), (void *, data),
                                        (size_t, size)))
 {
     dfc_sort_t * sort;
@@ -1509,72 +1368,80 @@ SYS_LOCK_CREATE(dfc_sort_client_add, ((dfc_request_t *, req)))
 {
     dfc_dependencies_t deps;
     dfc_client_t * client;
-    dfc_request_t * tmp;
+    dfc_request_t * tmp, * aux;
     dfc_sort_t * sort;
     struct list_head * item;
-    int64_t seq;
+    int64_t id, seq;
     err_t error = ENOBUFS;
     int32_t idx;
 
     client = req->client;
 
-//    logI("Preparing sort request for txn %ld", req->txn);
-
-    SYS_CALL(
-        dfc_dependency_build, (&deps, req),
-        E(),
-        GOTO(failed)
-    );
-
-    dfc_dependency_dump(req, &deps);
-
-    sort = client->sort;
-    if (sort != NULL)
-    {
-        error = sys_buf_set_block(&sort->head, &sort->size, deps.data,
-                                  sizeof(deps.data) - deps.size);
-    }
-    if (error != 0)
-    {
-        SYS_CALL(
-            dfc_sort_create, (client),
-            E(),
-            GOTO(failed, &error)
-        );
-        sort = client->sort;
-        SYS_CALL(
-            sys_buf_set_block, (&sort->head, &sort->size, deps.data,
-                                sizeof(deps.data) - deps.size),
-            E(),
-            GOTO(failed, &error)
-        );
-    }
-
-    if (sort->pending)
-    {
-        sort->pending = false;
-        // Delay send to allow other requests to be accumulated.
-        SYS_LOCK(&client->lock, dfc_sort_client_send, (client, sort));
-    }
-
-    idx = req->txn & client->txn_mask;
+    id = req->txn >> 8;
+    idx = id & client->txn_mask;
     item = &client->requests[idx];
+    tmp = NULL;
     if (!list_empty(item))
     {
         item = item->prev;
         do
         {
             tmp = list_entry(item, dfc_request_t, ready_pending_list);
-            if (tmp->txn < req->txn)
+            if ((tmp->txn >> 8) <= id)
             {
                 break;
             }
             item = item->prev;
         } while (item != &client->requests[idx]);
     }
-    list_add(&req->ready_pending_list, item);
-//    logI("Added transaction %ld(%ld)", req->txn, req->seq);
+    if ((tmp == NULL) || ((tmp->txn >> 8) != id))
+    {
+        SYS_CALL(
+            dfc_dependency_build, (&deps, req),
+            E(),
+            GOTO(failed)
+        );
 
+        sort = client->sort;
+        if (sort != NULL)
+        {
+            error = sys_buf_set_block(&sort->head, &sort->size, deps.data,
+                                      sizeof(deps.data) - deps.size);
+        }
+        if (error != 0)
+        {
+            SYS_CALL(
+                dfc_sort_create, (client),
+                E(),
+                GOTO(failed, &error)
+            );
+            sort = client->sort;
+            SYS_CALL(
+                sys_buf_set_block, (&sort->head, &sort->size, deps.data,
+                                    sizeof(deps.data) - deps.size),
+                E(),
+                GOTO(failed, &error)
+            );
+        }
+
+        if (sort->pending)
+        {
+            sort->pending = false;
+            // Delay send to allow other requests to be accumulated.
+            SYS_LOCK(&client->lock, dfc_sort_client_send, (client, sort));
+        }
+
+        list_add(&req->ready_pending_list, item);
+    }
+    else
+    {
+        req->root = tmp;
+        list_add_tail(&req->sibling_list, &tmp->sibling_list);
+        tmp->seq &= req->seq;
+        sys_delay_cancel((uintptr_t *)req->delay, false);
+    }
+
+    tmp = NULL;
     item = &client->sequence;
     if (!list_empty(item))
     {
@@ -1582,29 +1449,48 @@ SYS_LOCK_CREATE(dfc_sort_client_add, ((dfc_request_t *, req)))
         do
         {
             tmp = list_entry(item, dfc_request_t, sequence_list);
-            if ((tmp->seq & INT64_MAX) < (req->seq & INT64_MAX))
+            if ((tmp->seq & INT64_MAX) <= (req->seq & INT64_MAX))
             {
                 break;
             }
             item = item->prev;
         } while (item != &client->sequence);
     }
-    list_add(&req->sequence_list, item);
-
-    seq = client->next_seq;
-    if (req->seq == seq)
+    if ((tmp == NULL) || ((tmp->seq & INT64_MAX) != (req->seq & INT64_MAX)))
     {
-        do
+        list_add(&req->sequence_list, item);
+
+        seq = client->next_seq;
+        if (req->seq == seq)
         {
-            seq++;
-            item = req->sequence_list.next;
-            if (item == &client->sequence)
+            aux = req;
+            do
             {
-                break;
+                seq++;
+                item = aux->sequence_list.next;
+                if (item == &client->sequence)
+                {
+                    break;
+                }
+                aux = list_entry(item, dfc_request_t, sequence_list);
+            } while (aux->seq == seq);
+            client->next_seq = seq;
+        }
+    }
+    else
+    {
+        if (tmp->ready)
+        {
+            if ((req->seq & INT64_MIN) == 0)
+            {
+                list_del_init(&tmp->ready_pending_list);
+                list_del_init(&tmp->sequence_list);
             }
-            req = list_entry(item, dfc_request_t, sequence_list);
-        } while (req->seq == seq);
-        client->next_seq = seq;
+        }
+        if (tmp->started)
+        {
+            dfc_request_execute(tmp);
+        }
     }
 
     SYS_UNLOCK(&client->lock);
@@ -1641,7 +1527,6 @@ err_t dfc_analyze(dfc_manager_t * dfc, dict_t ** xdata, uuid_t uuid,
     size_t length;
     uint32_t mask;
     uint8_t data[1024];
-    char uuid1[48];
 
     mask = 0;
 
@@ -1721,9 +1606,6 @@ err_t dfc_analyze(dfc_manager_t * dfc, dict_t ** xdata, uuid_t uuid,
         memcpy(*sort, data, length);
     }
 
-//    logI("Request from %s: %ld(%ld), %lu", dfc_uuid(uuid1, uuid), txn[0],
-//         txn[1], (mask & 4) ? length : 0);
-
     return 0;
 }
 
@@ -1731,20 +1613,19 @@ void dfc_sort_client_process(dfc_request_t * req)
 {
     bool deps;
 
-//    logI("Executing request %lu", req->txn);
-
     deps = false;
-    if (req->link1.inode != NULL)
+    if (!req->completed)
     {
-//        logI("Executing %lu on inode1", req->txn);
-        dfc_link_execute(&req->link1);
-        deps = true;
-    }
-    if (req->link2.inode != NULL)
-    {
-//        logI("Executing %lu on inode2", req->txn);
-        dfc_link_execute(&req->link2);
-        deps = true;
+        if (req->link1.inode != NULL)
+        {
+            dfc_link_execute(&req->link1);
+            deps = true;
+        }
+        if (req->link2.inode != NULL)
+        {
+            dfc_link_execute(&req->link2);
+            deps = true;
+        }
     }
 
     if (!deps)
@@ -1759,6 +1640,8 @@ SYS_LOCK_CREATE(__dfc_sort_client_process_timeout, ((dfc_request_t *, req)))
     list_del_init(&req->sequence_list);
 
     req->sorted = true;
+    req->ready = true;
+    req->bad = true;
 
     dfc_sort_client_process(req);
 }
@@ -1791,14 +1674,18 @@ SYS_LOCK_CREATE(dfc_managed, ((dfc_manager_t *, dfc), (dfc_request_t *, req),
     INIT_LIST_HEAD(&req->link2.inode_list);
     INIT_LIST_HEAD(&req->link2.cycle);
     INIT_LIST_HEAD(&req->ready_pending_list);
+    INIT_LIST_HEAD(&req->sibling_list);
 
+    req->root = req;
+
+    req->completed = false;
     req->bad = false;
     req->sorted = false;
+    req->ready = false;
+    req->started = false;
 
     req->sort = NULL;
     req->sort_size = -1;
-
-//    logI("Managing txn %ld", req->txn);
 
     req->delay = SYS_DELAY(2000, dfc_sort_client_process_timeout, (req), 1);
     SYS_LOCK(&client->lock, dfc_sort_client_add, (req));
@@ -1858,11 +1745,10 @@ failed:
 }
 
 void dfc_sort_handler(dfc_manager_t * dfc, call_frame_t * frame, xlator_t * xl,
-                      uuid_t uuid, int64_t txn, void * sort, size_t size)
+                      uuid_t uuid, int64_t * txn, void * sort, size_t size)
 {
     dfc_client_t * client;
 
-//    logI("Handling %p", frame);
     SYS_CALL(
         dfc_client_get, (dfc, uuid, &client),
         E(),
@@ -2164,17 +2050,15 @@ static inline err_t dfc_check_getxattr(dfc_manager_t * dfc,
 
     if ((error == 0) && (sort != NULL))
     {
-        if ((loc->name == NULL) && (strcmp(loc->path, "/") == 0))
-        {
-            logT("DFC(getxattr) sort");
-            dfc_sort_handler(dfc, frame, xl, uuid, *txn, sort, size);
+        logT("DFC(getxattr) sort");
+        dfc_sort_handler(dfc, frame, xl, uuid, txn, sort, size);
 
+        if (txn[0] == 0)
+        {
             return EALREADY;
         }
 
-        SYS_FREE(sort);
-
-        return EINVAL;
+        return EBUSY;
     }
 
     if (sort != NULL)
@@ -2255,6 +2139,14 @@ DFC_CHECK(fxattrop)
             sys_loc_acquire(&req->loc, _loc); \
             sys_fd_acquire(&req->fd, _fd); \
             req->update = dfc_managed_##_fop##_update; \
+            INIT_LIST_HEAD(&req->sibling_list); \
+            req->root = req; \
+            req->fake = false; \
+            if (error == EBUSY) \
+            { \
+                req->fake = true; \
+                error = 0; \
+            } \
             if (error == 0) \
             { \
                 logT("DFC(" #_fop ") managed"); \

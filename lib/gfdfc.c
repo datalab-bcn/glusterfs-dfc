@@ -22,32 +22,6 @@
 
 #include "gfdfc.h"
 
-/*
-typedef struct _dfc_queue
-{
-    uint64_t           next_id;
-    struct list_head * requests;
-    int32_t            mask;
-    int32_t            pending;
-} dfc_queue_t;
-
-typedef struct _dfc_sort_data
-{
-    uint64_t   txn_id;
-    uint16_t   server;
-    uint16_t   me;
-    uint32_t   count;
-    uint64_t * values;
-} dfc_sort_data_t;
-*/
-
-int32_t __xdata_dump(dict_t * xdata, char * key, data_t * value, void * data)
-{
-    logI("    %s: %u", key, value->len);
-
-    return 0;
-}
-
 void dfc_sort_initialize(dfc_sort_t * sort)
 {
     sort->head = sort->data;
@@ -160,7 +134,8 @@ failed:
     return error;
 }
 
-err_t __dfc_sort_send(dfc_child_t * child, dfc_sort_t * sort);
+err_t __dfc_sort_send(dfc_child_t * child, loc_t * loc, int64_t txn,
+                      int64_t seq, dfc_sort_t * sort);
 
 void dfc_request_free(dfc_request_t * req)
 {
@@ -175,7 +150,8 @@ void dfc_request_free(dfc_request_t * req)
         if (child->active < child->dfc->requests)
         {
             dfc_sort_initialize(&sort);
-            __dfc_sort_send(child, &sort);
+            __dfc_sort_send(child, &child->dfc->root_loc, 0, child->seq,
+                            &sort);
         }
         else if ((child->count < child->dfc->max_requests) ||
                  list_empty(&child->pool))
@@ -201,16 +177,111 @@ void dfc_transaction_destroy(dfc_transaction_t * txn)
 
     sys_mutex_unlock(&txn->dfc->lock);
 
+    if (txn->inode != NULL)
+    {
+        inode_unref(txn->inode);
+    }
+
     SYS_FREE(txn);
 }
 
-err_t dfc_transaction_create(dfc_t * dfc, uint64_t mask, dict_t * xdata,
-                             dfc_transaction_t ** txn)
+SYS_LOCK_DECLARE(dfc_sort_send, ((dfc_child_t *, child),
+                                 (loc_t, loc, PTR, sys_loc_acquire,
+                                                   sys_loc_release),
+                                 (int64_t, txn),
+                                 (int64_t, seq),
+                                 (dfc_sort_t *, sort)));
+
+SYS_ASYNC_CREATE(dfc_transaction_extra, ((dfc_t *, dfc),
+                                         (uint64_t, mask),
+                                         (dfc_transaction_t *, txn)))
+{
+    loc_t loc;
+    dfc_child_t * child;
+    int32_t i;
+
+    memset(&loc, 0, sizeof(loc));
+    loc.inode = txn->inode;
+    i = 0;
+
+    sys_mutex_lock(&dfc->lock);
+
+    list_for_each_entry(child, &dfc->children, list)
+    {
+        if (mask & 1)
+        {
+            SYS_LOCK(
+                &child->lock,
+                dfc_sort_send, (child, &loc, txn->id, txn->seqs[i],
+                                NULL)
+            );
+            mask ^= 1;
+            if (mask == 0)
+            {
+                break;
+            }
+        }
+        mask >>= 1;
+        i++;
+    }
+
+    sys_mutex_unlock(&dfc->lock);
+}
+
+dfc_transaction_t * dfc_txn_lookup(dfc_t * dfc, int64_t num)
+{
+    dfc_transaction_t * txn;
+    struct list_head * item;
+    int64_t id;
+
+    id = num & dfc->txn_mask;
+    item = dfc->txns[id].next;
+    txn = NULL;
+    while (item != &dfc->txns[id])
+    {
+        txn = list_entry(item, dfc_transaction_t, list);
+        if (txn->id >= num)
+        {
+            if (txn->id != num)
+            {
+                txn = NULL;
+            }
+            break;
+        }
+        item = item->next;
+    }
+
+    return txn;
+}
+
+void dfc_txn_insert(dfc_t * dfc, dfc_transaction_t * txn)
+{
+    dfc_transaction_t * tmp;
+    struct list_head * item;
+    int64_t id;
+
+    id = txn->id & dfc->txn_mask;
+    item = dfc->txns[id].prev;
+    while (item != &dfc->txns[id])
+    {
+        tmp = list_entry(item, dfc_transaction_t, list);
+        if (tmp->id <= txn->id)
+        {
+            break;
+        }
+        item = item->prev;
+    }
+
+    list_add(&txn->list, item);
+}
+
+err_t dfc_transaction_create(dfc_t * dfc, uint64_t mask, inode_t * inode,
+                             dict_t * xdata, dfc_transaction_t ** txn)
 {
     dfc_transaction_t * tmp, * aux;
     dfc_child_t * child;
-    struct list_head * item;
-    int64_t id, txn_ids[2];
+    int64_t txn_ids[2];
+    uint64_t bits;
     size_t len;
     int32_t i;
     err_t error;
@@ -224,8 +295,10 @@ err_t dfc_transaction_create(dfc_t * dfc, uint64_t mask, dict_t * xdata,
     );
 
     tmp->dfc = dfc;
-    tmp->mask = 0;
-    tmp->state = 0;
+    tmp->mask = mask;
+    tmp->sorted = 0;
+    tmp->state = sys_bits_count64(mask);
+    tmp->state |= tmp->state << 16;
 
     sys_mutex_lock(&dfc->lock);
 
@@ -238,33 +311,52 @@ err_t dfc_transaction_create(dfc_t * dfc, uint64_t mask, dict_t * xdata,
             E(),
             GOTO(failed, &error)
         );
-        tmp->id = ntoh64(txn_ids[0]);
-        id = tmp->id & dfc->txn_mask;
-        item = dfc->txns[id].next;
-        aux = NULL;
-        while (item != &dfc->txns[id])
-        {
-            aux = list_entry(item, dfc_transaction_t, list);
-            if (aux->id >= tmp->id)
-            {
-                break;
-            }
-            item = item->next;
-        }
+        aux = dfc_txn_lookup(dfc, ntoh64(txn_ids[0]));
         SYS_TEST(
-            (aux != NULL) && (aux->id <= tmp->id),
+            aux != NULL,
             ENOENT,
             E(),
             GOTO(failed, &error)
         );
+        aux = aux->root;
+        tmp->root = aux;
+        tmp->id = ++aux->subtxn;
         for (i = 0; i < dfc->count; i++)
         {
             tmp->seqs[i] = aux->seqs[i] | INT64_MIN;
         }
+        tmp->inode = inode_ref(aux->inode);
+
+        aux->group |= mask;
+        tmp->group = aux->group;
+        bits = aux->group & ~mask & ~aux->extra;
+        aux->extra |= bits;
+        tmp->extra = aux->extra;
+
+        dfc_txn_insert(dfc, tmp);
+
+        dfc_sort_initialize(&tmp->sort);
+        sys_buf_set_int64(&tmp->sort.head, &tmp->sort.size, tmp->id);
+
+        sys_mutex_initialize(&tmp->lock);
+
+        if (bits != 0)
+        {
+            SYS_ASYNC(dfc_transaction_extra, (dfc, bits, tmp));
+        }
     }
     else
     {
-        tmp->id = ++dfc->current_txn;
+        tmp->group = mask;
+        tmp->extra = 0;
+        if (inode != NULL)
+        {
+            inode = inode_ref(inode);
+        }
+        tmp->inode = inode;
+        dfc->current_txn += 256;
+        tmp->subtxn = tmp->id = dfc->current_txn;
+        tmp->root = tmp;
         i = 0;
         list_for_each_entry(child, &dfc->children, list)
         {
@@ -280,24 +372,13 @@ err_t dfc_transaction_create(dfc_t * dfc, uint64_t mask, dict_t * xdata,
             mask >>= 1;
         }
 
-        id = tmp->id & dfc->txn_mask;
-        item = dfc->txns[id].prev;
-        while (item != &dfc->txns[id])
-        {
-            aux = list_entry(item, dfc_transaction_t, list);
-            if (aux->id < tmp->id)
-            {
-                break;
-            }
-        }
+        dfc_txn_insert(dfc, tmp);
+
+        dfc_sort_initialize(&tmp->sort);
+        sys_buf_set_int64(&tmp->sort.head, &tmp->sort.size, tmp->id);
+
+        sys_mutex_initialize(&tmp->lock);
     }
-    list_add_tail(&tmp->list, item);
-
-    dfc_sort_initialize(&tmp->sort);
-    sys_buf_set_int64(&tmp->sort.head, &tmp->sort.size, tmp->id);
-
-    sys_mutex_initialize(&tmp->lock);
-
     sys_mutex_unlock(&dfc->lock);
 
     *txn = tmp;
@@ -354,9 +435,8 @@ err_t dfc_sort_process_one(dfc_t * dfc, dfc_child_t * child, void * data,
                            size_t size)
 {
     dfc_transaction_t * txn;
-    struct list_head * item;
     uuid_t * uuid;
-    int64_t id, num, need;
+    int64_t num, need;
     err_t error;
 
     SYS_CALL(
@@ -365,36 +445,22 @@ err_t dfc_sort_process_one(dfc_t * dfc, dfc_child_t * child, void * data,
         RETERR()
     );
 
-//    logI("Sort request for txn %lu", num);
-
-    id = num & dfc->txn_mask;
-
     sys_mutex_lock(&dfc->lock);
 
-    item = dfc->txns[id].next;
-    while (item != &dfc->txns[id])
+    txn = dfc_txn_lookup(dfc, num);
+    if (txn != NULL)
     {
-        txn = list_entry(item, dfc_transaction_t, list);
-        if (txn->id >= num)
-        {
-            if (txn->id == num)
-            {
-                goto found;
-            }
-
-            break;
-        }
-        item = item->next;
+        txn = txn->root;
     }
 
     sys_mutex_unlock(&dfc->lock);
 
-    logE("Unknown referenced transaction.");
-
-    return ENOENT;
-
-found:
-    sys_mutex_unlock(&dfc->lock);
+    SYS_TEST(
+        txn != NULL,
+        ENOENT,
+        W(),
+        RETERR()
+    );
 
     sys_mutex_lock(&txn->lock);
 
@@ -418,7 +484,7 @@ found:
         );
     }
 
-    txn->mask |= 1 << child->idx;
+    txn->sorted |= 1ULL << child->idx;
 
     SYS_TEST(
         size == 0,
@@ -433,71 +499,19 @@ found:
 failed_lock:
     sys_mutex_unlock(&txn->lock);
 
-//    logD("Transaction %lu is ready (%d)", num, txn->state);
-
     if ((atomic_dec(&txn->state, memory_order_seq_cst) & 0xFFFF) == 1)
     {
-//        logI("Sending sort info for %ld to %lX", num, txn->mask);
-        dfc_request_send(txn->dfc, txn->mask, txn->sort.data,
+        dfc_request_send(txn->dfc, txn->sorted, txn->sort.data,
                          sizeof(txn->sort.data) - txn->sort.size);
     }
 
     return error;
 }
 
-static char dfc_hex[] = "0123456789ABCDEF";
-
-void dfc_dump(char * text, uint8_t * data, size_t size)
-{
-    uint32_t off, i;
-    char buf[80];
-
-    if (size == 0)
-    {
-        return;
-    }
-
-    logI("%s:", text);
-    buf[4] = ' ';
-    buf[5] = '|';
-    buf[54] = ' ';
-    buf[55] = '|';
-    buf[56] = ' ';
-    buf[73] = 0;
-    off = 0;
-    do
-    {
-        buf[0] = dfc_hex[off >> 24];
-        buf[1] = dfc_hex[(off >> 16) & 15];
-        buf[2] = dfc_hex[(off >> 8) & 15];
-        buf[3] = dfc_hex[off & 15];
-        off += 16;
-        for (i = 0; i < 16; i++)
-        {
-            if (size > 0)
-            {
-                size--;
-                buf[6 + i * 3] = ' ';
-                buf[7 + i * 3] = dfc_hex[*data >> 4];
-                buf[8 + i * 3] = dfc_hex[*data & 15];
-                buf[57 + i] = *data++;
-            }
-            else
-            {
-                buf[6 + i * 3] = buf[7 + i * 3] = buf[8 + i * 3] = ' ';
-                buf[57 + i] = '.';
-            }
-        }
-        logI("   %s", buf);
-    } while (size > 0);
-}
-
 err_t dfc_sort_process(dfc_t * dfc, dfc_child_t * child, dfc_sort_t * sort)
 {
     void * data;
     uint32_t length;
-
-//    dfc_dump("Recv", sort->head, sort->size);
 
     while (sort->size > 0)
     {
@@ -528,12 +542,6 @@ SYS_CBK_CREATE(dfc_sort_recv, data, ((dfc_t *, dfc), (dfc_request_t *, req)))
     atomic_dec(&req->child->active, memory_order_seq_cst);
 
     args = (SYS_GF_WIND_CBK_TYPE(getxattr) *)data;
-//    logT("Processing sort request:");
-//    if (args->dict != NULL)
-//    {
-//        dict_foreach(args->dict, __xdata_dump, NULL);
-//    }
-
     if (args->op_ret >= 0)
     {
         sort = &req->sort;
@@ -563,7 +571,8 @@ done:
     dfc_request_free(req);
 }
 
-err_t __dfc_sort_send(dfc_child_t * child, dfc_sort_t * sort)
+err_t __dfc_sort_send(dfc_child_t * child, loc_t * loc, int64_t txn,
+                      int64_t seq, dfc_sort_t * sort)
 {
     dfc_request_t * req;
     dict_t * xdata;
@@ -586,20 +595,16 @@ err_t __dfc_sort_send(dfc_child_t * child, dfc_sort_t * sort)
 
     xdata = NULL;
     SYS_CALL(
-        __dfc_attach, (child->dfc, 0, child->seq, sort->data,
+        __dfc_attach, (child->dfc, txn, seq, sort->data,
                        sizeof(sort->data) - sort->size, &xdata),
         E(),
         LOG(E(), "Failed to prepare a DFC sort request."),
         GOTO(failed, &error)
     );
 
-//    logI("getxattr xdata = %p", xdata);
-//    dict_foreach(xdata, __xdata_dump, NULL);
     atomic_inc(&child->active, memory_order_seq_cst);
-//    dfc_dump("Send", sort->data, sizeof(sort->data) - sort->size);
-    SYS_IO(sys_gf_getxattr_wind, (req->frame, NULL, child->xl,
-                                  &child->dfc->root_loc, DFC_XATTR_SORT,
-                                  xdata),
+    SYS_IO(sys_gf_getxattr_wind, (req->frame, NULL, child->xl, loc,
+                                  DFC_XATTR_SORT, xdata),
            SYS_CBK(dfc_sort_recv, (child->dfc, req)), NULL);
 
     sys_dict_release(xdata);
@@ -612,10 +617,20 @@ failed:
     return error;
 }
 
-SYS_LOCK_CREATE(dfc_sort_send, ((dfc_child_t *, child), (dfc_sort_t *, sort)))
+SYS_LOCK_DEFINE(dfc_sort_send, ((dfc_child_t *, child),
+                                (loc_t, loc, PTR, sys_loc_acquire,
+                                                  sys_loc_release),
+                                (int64_t, txn),
+                                (int64_t, seq),
+                                (dfc_sort_t *, sort)))
 {
+    if (sort == NULL)
+    {
+        sort = child->sort;
+    }
+
     SYS_CALL(
-        __dfc_sort_send, (child, sort),
+        __dfc_sort_send, (child, loc, txn, seq, sort),
         E(),
         GOTO(failed)
     );
@@ -670,7 +685,8 @@ SYS_LOCK_CREATE(dfc_sort_add, ((dfc_child_t *, child), (void *, data),
     if (sort->pending)
     {
         sort->pending = false;
-        SYS_LOCK(&child->lock, dfc_sort_send, (child, sort));
+        SYS_LOCK(&child->lock, dfc_sort_send, (child, &child->dfc->root_loc, 0,
+                                               child->seq, sort));
     }
 
 failed:
@@ -680,8 +696,6 @@ failed:
 void dfc_request_send(dfc_t * dfc, uint64_t mask, void * data, size_t size)
 {
     dfc_child_t * child;
-
-    logD("Sending %lu bytes of sort data to childs %lX", size, mask);
 
     list_for_each_entry(child, &dfc->children, list)
     {
@@ -911,7 +925,8 @@ SYS_CBK_CREATE(__dfc_start_cbk, io, ((dfc_t *, dfc), (dfc_child_t *, child)))
             for (i = 0; i < dfc->requests; i++)
             {
                 SYS_CALL(
-                    __dfc_sort_send, (child, &sort),
+                    __dfc_sort_send, (child, &child->dfc->root_loc, 0,
+                                      child->seq, &sort),
                     E()
                 );
             }
@@ -1026,13 +1041,13 @@ int32_t dfc_default_notify(dfc_t * dfc, xlator_t * xl, int32_t event,
     return 0;
 }
 
-err_t dfc_begin(dfc_t * dfc, uint64_t mask, dict_t * xdata,
+err_t dfc_begin(dfc_t * dfc, uint64_t mask, inode_t * inode, dict_t * xdata,
                 dfc_transaction_t ** txn)
 {
     dfc_transaction_t * tmp;
 
     SYS_CALL(
-        dfc_transaction_create, (dfc, mask, xdata, &tmp),
+        dfc_transaction_create, (dfc, mask, inode, xdata, &tmp),
         E(),
         RETERR()
     );
@@ -1040,26 +1055,6 @@ err_t dfc_begin(dfc_t * dfc, uint64_t mask, dict_t * xdata,
     *txn = tmp;
 
     return 0;
-}
-
-void dfc_end(dfc_transaction_t * txn, uint32_t count)
-{
-    uint32_t state;
-
-    if (txn != NULL)
-    {
-        state = atomic_add_return(&txn->state, (count << 16) | count,
-                                  memory_order_seq_cst);
-        if ((state >> 16) == 0)
-        {
-            dfc_transaction_destroy(txn);
-        }
-        else if ((state & 0xFFFF) == 0)
-        {
-            dfc_request_send(txn->dfc, txn->mask, txn->sort.data,
-                             sizeof(txn->sort.data) - txn->sort.size);
-        }
-    }
 }
 
 err_t dfc_attach(dfc_transaction_t * txn, int32_t idx, dict_t ** xdata)
@@ -1076,17 +1071,43 @@ err_t dfc_attach(dfc_transaction_t * txn, int32_t idx, dict_t ** xdata)
     return 0;
 }
 
-bool dfc_complete(dfc_transaction_t * txn)
+bool dfc_failed(dfc_transaction_t * txn, int32_t count)
 {
-    if (txn != NULL)
-    {
-        if ((atomic_sub(&txn->state, 0x10000, memory_order_seq_cst) >> 16) != 1)
-        {
-            return false;
-        }
+    uint32_t state;
 
+    if (txn == NULL)
+    {
+        return true;
+    }
+    state = count | (count << 16);
+    state = atomic_sub_return(&txn->state, state, memory_order_seq_cst);
+    if ((state >> 16) == 0)
+    {
         dfc_transaction_destroy(txn);
+
+        return true;
+    }
+    if ((state & 0xFFFF) == 0)
+    {
+        dfc_request_send(txn->dfc, txn->sorted, txn->sort.data,
+                         sizeof(txn->sort.data) - txn->sort.size);
     }
 
-    return true;
+    return false;
+}
+
+bool dfc_complete(dfc_transaction_t * txn)
+{
+    if (txn == NULL)
+    {
+        return true;
+    }
+    if ((atomic_sub(&txn->state, 0x10000, memory_order_seq_cst) >> 16) == 1)
+    {
+        dfc_transaction_destroy(txn);
+
+        return true;
+    }
+
+    return false;
 }

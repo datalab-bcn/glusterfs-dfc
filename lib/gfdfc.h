@@ -66,14 +66,20 @@ struct _dfc_request
 
 struct _dfc_transaction
 {
-    sys_mutex_t      lock;
-    struct list_head list;
-    int64_t          id;
-    dfc_t *          dfc;
-    uint64_t         mask;
-    uint32_t         state;
-    dfc_sort_t       sort;
-    uint64_t         seqs[];
+    sys_mutex_t         lock;
+    struct list_head    list;
+    dfc_transaction_t * root;
+    int64_t             id;
+    int64_t             subtxn;
+    dfc_t *             dfc;
+    uint64_t            group;
+    uint64_t            sorted;
+    uint64_t            mask;
+    uint64_t            extra;
+    uint32_t            state;
+    inode_t *           inode;
+    dfc_sort_t          sort;
+    uint64_t            seqs[];
 };
 
 struct _dfc_child
@@ -126,10 +132,10 @@ void dfc_start(dfc_t * dfc, xlator_t * xl);
 void dfc_stop(dfc_t * dfc, xlator_t * xl);
 int32_t dfc_default_notify(dfc_t * dfc, xlator_t * xl, int32_t event,
                            void * data);
-err_t dfc_begin(dfc_t * dfc, uint64_t mask, dict_t * xdata,
+err_t dfc_begin(dfc_t * dfc, uint64_t mask, inode_t * inode, dict_t * xdata,
                 dfc_transaction_t ** txn);
 err_t dfc_attach(dfc_transaction_t * txn, int32_t idx, dict_t ** xdata);
-void dfc_end(dfc_transaction_t * txn, uint32_t count);
+bool dfc_failed(dfc_transaction_t * txn, int32_t count);
 bool dfc_complete(dfc_transaction_t * txn);
 
 #endif /* __GFDFC_H__ */
