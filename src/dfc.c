@@ -1008,7 +1008,8 @@ void dfc_size_save(dfc_request_t * req)
     uint64_t value;
 
     if ((req->inode != NULL) &&
-        (inode_ctx_get2(req->inode, req->xl, NULL, &value) == 0))
+        (inode_ctx_get2(req->inode, req->xl, NULL, &value) == 0) &&
+        (value != 0))
     {
         inode = (dfc_inode_t *)value;
         req->size = inode->new_size;
@@ -1027,7 +1028,8 @@ dfc_inode_t * dfc_size_update(dfc_request_t * req, dict_t ** xdata)
     inode = NULL;
     value = -1;
 
-    if (inode_ctx_get2(req->inode, req->xl, NULL, &value) == 0)
+    if ((inode_ctx_get2(req->inode, req->xl, NULL, &value) == 0) &&
+        (value != 0))
     {
         inode = (dfc_inode_t *)value;
         value = inode->new_size;
@@ -1882,28 +1884,28 @@ SYS_CBK_DEFINE(dfc_update_size_xattr_fcbk, io,
 #define DFC_UPDATE(_fop, _inode, _pre, _post) \
     void dfc_managed_##_fop##_update(dfc_request_t * req, uintptr_t * data) \
     { \
-        size_t * psize; \
+        struct iatt * piatt; \
         dfc_inode_t * inode; \
         SYS_GF_WIND_CBK_TYPE(_fop) * args; \
         args = (SYS_GF_WIND_CBK_TYPE(_fop) *)data; \
         if (args->op_ret >= 0) \
         { \
-            psize = SYS_SELECT(&args->_pre.ia_size, NULL, _pre); \
-            if (psize != NULL) \
+            piatt = SYS_SELECT(&args->_pre, NULL, _pre); \
+            if ((piatt != NULL)  && (piatt->ia_type == IA_IFREG)) \
             { \
-                *psize = req->size; \
+                piatt->ia_size = req->size; \
             } \
-            req->inode = SYS_SELECT(args->_inode, req->inode, _inode); \
-            inode = dfc_size_update(req, &args->xdata); \
-            if (inode != NULL) \
+            piatt = SYS_SELECT(&args->_post, NULL, _post); \
+            if ((piatt != NULL) && (piatt->ia_type == IA_IFREG)) \
             { \
-                dfc_update_size_xattr(NULL, req->xl, req->fd, &req->loc, \
-                                      inode); \
-            } \
-            psize = SYS_SELECT(&args->_post.ia_size, NULL, _post); \
-            if (psize != NULL) \
-            { \
-                *psize = req->size; \
+                req->inode = SYS_SELECT(args->_inode, req->inode, _inode); \
+                inode = dfc_size_update(req, &args->xdata); \
+                if (inode != NULL) \
+                { \
+                    dfc_update_size_xattr(NULL, req->xl, req->fd, &req->loc, \
+                                          inode); \
+                } \
+                piatt->ia_size = req->size; \
             } \
         } \
     }
@@ -1918,9 +1920,12 @@ void dfc_managed_readdir_update(dfc_request_t * req, uintptr_t * data)
     {
         list_for_each_entry(entry, &args->entries.list, list)
         {
-            req->inode = entry->inode;
-            dfc_size_update(req, &entry->dict);
-            entry->d_stat.ia_size = req->size;
+            if (entry->d_stat.ia_type == IA_IFREG)
+            {
+                req->inode = entry->inode;
+                dfc_size_update(req, &entry->dict);
+                entry->d_stat.ia_size = req->size;
+            }
         }
     }
 }
@@ -1935,9 +1940,12 @@ void dfc_managed_readdirp_update(dfc_request_t * req, uintptr_t * data)
     {
         list_for_each_entry(entry, &args->entries.list, list)
         {
-            req->inode = entry->inode;
-            dfc_size_update(req, &entry->dict);
-            entry->d_stat.ia_size = req->size;
+            if (entry->d_stat.ia_type == IA_IFREG)
+            {
+                req->inode = entry->inode;
+                dfc_size_update(req, &entry->dict);
+                entry->d_stat.ia_size = req->size;
+            }
         }
     }
 }
