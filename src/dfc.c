@@ -2178,6 +2178,8 @@ DFC_CHECK(fxattrop)
                 req->link2.inode = NULL; \
                 req->refs = 0; \
                 req->bad = error != ENOENT; \
+                req->started = false; \
+                req->completed = false; \
                 dfc_request_execute(req); \
             } \
         } \
