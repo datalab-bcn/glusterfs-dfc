@@ -1015,6 +1015,7 @@ void dfc_size_save(dfc_request_t * req)
     dfc_inode_t * inode;
     uint64_t value;
 
+    value = 0;
     if ((req->inode != NULL) &&
         (inode_ctx_get2(req->inode, req->xl, NULL, &value) == 0) &&
         (value != 0))
@@ -1037,7 +1038,7 @@ dfc_inode_t * dfc_size_update(dfc_request_t * req, dict_t ** xdata)
     value = -1;
 
     if ((inode_ctx_get2(req->inode, req->xl, NULL, &value) == 0) &&
-        (value != 0))
+        (value != -1))
     {
         inode = (dfc_inode_t *)value;
         value = inode->new_size;
