@@ -939,15 +939,15 @@ SYS_LOCK_CREATE(__dfc_request_complete, ((dfc_request_t *, req)))
     {
         if ((root->seq & INT64_MIN) == 0)
         {
+            client->next_txn += 256;
             if (root->sequence_list.next != &client->sequence)
             {
                 next = list_entry(root->sequence_list.next, dfc_request_t,
                                   sequence_list);
-                client->next_txn = next->txn;
-            }
-            else
-            {
-                client->next_txn += 256;
+                if ((root->seq & INT64_MAX) + 1 == (next->seq & INT64_MAX))
+                {
+                    client->next_txn = next->txn;
+                }
             }
             list_del_init(&root->sequence_list);
 
@@ -1253,7 +1253,6 @@ void __dfc_serialize(dfc_client_t * client, dfc_request_t * req)
         if ((req->seq & INT64_MIN) == 0)
         {
             list_del_init(&req->ready_pending_list);
-            list_del_init(&req->sequence_list);
         }
 
         req->ready = true;
@@ -1495,7 +1494,6 @@ SYS_LOCK_CREATE(dfc_sort_client_add, ((dfc_request_t *, req)))
             if ((req->seq & INT64_MIN) == 0)
             {
                 list_del_init(&tmp->ready_pending_list);
-                list_del_init(&tmp->sequence_list);
             }
         }
         if (tmp->started)
