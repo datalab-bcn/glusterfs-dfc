@@ -2300,6 +2300,24 @@ DFC_FOP(fxattrop,     0)
 
 static int32_t dfc_forget(xlator_t * this, inode_t * inode)
 {
+    uint64_t value1, value2;
+    dfc_inode_t * ptr;
+
+    value1 = value2 = 0;
+    if (inode_ctx_get2(inode, this, &value1, &value2) == 0)
+    {
+        SYS_TEST(
+            value1 == 0,
+            EINVAL,
+            W()
+        );
+        if (value2 != 0)
+        {
+            ptr = (dfc_inode_t *)(uintptr_t)value2;
+            SYS_FREE(ptr);
+        }
+    }
+
     return 0;
 }
 
