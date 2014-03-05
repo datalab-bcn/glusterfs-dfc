@@ -542,30 +542,33 @@ SYS_CBK_CREATE(dfc_sort_recv, data, ((dfc_t *, dfc), (dfc_request_t *, req)))
     atomic_dec(&req->child->active, memory_order_seq_cst);
 
     args = (SYS_GF_WIND_CBK_TYPE(getxattr) *)data;
-    if (args->op_ret >= 0)
+    if (args->op_ret < 0)
     {
-        sort = &req->sort;
-        sort->head = sort->data;
-        sort->size = sizeof(sort->data);
-        SYS_CALL(
-            sys_dict_get_bin, (args->dict, DFC_XATTR_SORT, sort->data,
-                               &sort->size),
-            T(),
-            GOTO(done)
-        );
-
-        SYS_CALL(
-            dfc_sort_process, (dfc, req->child, sort),
-            E()
-        );
-    }
-    else
-    {
-        if (args->op_errno == ENOTCONN)
+        if ((args->op_errno == ENOTCONN) || (args->op_errno == ENODATA) ||
+            (req->child->active == 0))
         {
             dfc_stop(dfc, req->child->xl);
         }
+
+        dfc_request_destroy(req);
+
+        return;
     }
+
+    sort = &req->sort;
+    sort->head = sort->data;
+    sort->size = sizeof(sort->data);
+    SYS_CALL(
+        sys_dict_get_bin, (args->dict, DFC_XATTR_SORT, sort->data,
+                           &sort->size),
+        T(),
+        GOTO(done)
+    );
+
+    SYS_CALL(
+        dfc_sort_process, (dfc, req->child, sort),
+        E()
+    );
 
 done:
     dfc_request_free(req);
@@ -905,6 +908,24 @@ void dfc_terminate(dfc_t * dfc)
     dfc_destroy(dfc);
 }
 
+SYS_DELAY_CREATE(dfc_start_delayed, ((dfc_t *, dfc), (dfc_child_t *, child)))
+{
+    sys_mutex_lock(&dfc->lock);
+
+    if (child->state == DFC_CHILD_PREPARING)
+    {
+        dfc->active++;
+        child->state = DFC_CHILD_UP;
+        dfc->notify(dfc, child->xl, DFC_CHILD_UP);
+    }
+    else if (child->state == DFC_CHILD_STOPPING)
+    {
+        child->state = DFC_CHILD_DOWN;
+    }
+
+    sys_mutex_unlock(&dfc->lock);
+}
+
 SYS_CBK_CREATE(__dfc_start_cbk, io, ((dfc_t *, dfc), (dfc_child_t *, child)))
 {
     SYS_GF_WIND_CBK_TYPE(lookup) * args;
@@ -919,8 +940,7 @@ SYS_CBK_CREATE(__dfc_start_cbk, io, ((dfc_t *, dfc), (dfc_child_t *, child)))
     {
         if (args->op_ret == 0)
         {
-            child->state = DFC_CHILD_UP;
-            dfc->active++;
+            child->state = DFC_CHILD_PREPARING;
             dfc_sort_initialize(&sort);
             for (i = 0; i < dfc->requests; i++)
             {
@@ -930,7 +950,7 @@ SYS_CBK_CREATE(__dfc_start_cbk, io, ((dfc_t *, dfc), (dfc_child_t *, child)))
                     E()
                 );
             }
-            dfc->notify(dfc, child->xl, DFC_CHILD_UP);
+            SYS_DELAY(1000, dfc_start_delayed, (dfc, child));
         }
         else
         {
@@ -1007,7 +1027,8 @@ void dfc_stop(dfc_t * dfc, xlator_t * xl)
                 child->state = DFC_CHILD_DOWN;
                 dfc->notify(dfc, child->xl, DFC_CHILD_DOWN);
             }
-            else if (child->state == DFC_CHILD_STARTING)
+            else if ((child->state == DFC_CHILD_STARTING) ||
+                     (child->state == DFC_CHILD_PREPARING))
             {
                 child->state = DFC_CHILD_STOPPING;
             }

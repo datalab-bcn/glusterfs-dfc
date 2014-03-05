@@ -27,11 +27,12 @@
 #define DFC_XATTR_OFFSET "trusted.dfc.offset"
 #define DFC_XATTR_SIZE   "trusted.dfc.size"
 
-#define DFC_CHILD_DOWN     0
-#define DFC_CHILD_STARTING 1
-#define DFC_CHILD_STOPPING 2
-#define DFC_CHILD_UP       3
-#define DFC_CHILD_FAILED   4
+#define DFC_CHILD_DOWN      0
+#define DFC_CHILD_STARTING  1
+#define DFC_CHILD_PREPARING 2
+#define DFC_CHILD_STOPPING  3
+#define DFC_CHILD_UP        4
+#define DFC_CHILD_FAILED    5
 
 struct _dfc_sort;
 typedef struct _dfc_sort dfc_sort_t;
