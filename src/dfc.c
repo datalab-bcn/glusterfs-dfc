@@ -2162,19 +2162,23 @@ DFC_CHECK(fxattrop)
                 req->fake = true; \
                 error = 0; \
             } \
+            req->link2.inode = NULL; \
             if (error == 0) \
             { \
                 logT("DFC(" #_fop ") managed"); \
                 req->link1.inode = _inode2; \
-                req->link2.inode = _inode3; \
-                req->refs = ((_inode2) != NULL) + ((_inode3) != NULL); \
+                req->refs = (_inode2) != NULL; \
+                if ((_inode2) != (_inode3)) \
+                { \
+                    req->link2.inode = _inode3; \
+                    req->refs += (_inode3) != NULL; \
+                } \
                 SYS_LOCK(&dfc->lock, dfc_managed, (dfc, req, uuid)); \
             } \
             else \
             { \
                 req->client = NULL; \
                 req->link1.inode = NULL; \
-                req->link2.inode = NULL; \
                 req->refs = 0; \
                 req->bad = error != ENOENT; \
                 req->started = false; \
