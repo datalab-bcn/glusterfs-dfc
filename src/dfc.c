@@ -1888,6 +1888,31 @@ SYS_CBK_DEFINE(dfc_update_size_xattr_fcbk, io,
     dfc_update_size_xattr(frame, xl, fd, NULL, inode);
 }
 
+void dfc_fix_gfid(loc_t * loc, inode_t * inode, struct iatt * iatt)
+{
+    if (inode != NULL)
+    {
+        if (loc->inode != inode)
+        {
+            sys_inode_release(loc->inode);
+            sys_inode_acquire(&loc->inode, inode);
+        }
+        uuid_copy(loc->gfid, inode->gfid);
+    }
+
+    if (iatt != NULL)
+    {
+        if (uuid_is_null(loc->gfid))
+        {
+            uuid_copy(loc->gfid, iatt->ia_gfid);
+        }
+        else if (uuid_compare(loc->gfid, iatt->ia_gfid) != 0)
+        {
+            logW("GFID mismatch between loc and iatt");
+        }
+    }
+}
+
 #define DFC_UPDATE(_fop, _inode, _pre, _post) \
     void dfc_managed_##_fop##_update(dfc_request_t * req, uintptr_t * data) \
     { \
@@ -1906,6 +1931,7 @@ SYS_CBK_DEFINE(dfc_update_size_xattr_fcbk, io,
             if ((piatt != NULL) && (piatt->ia_type == IA_IFREG)) \
             { \
                 req->inode = SYS_SELECT(args->_inode, req->inode, _inode); \
+                dfc_fix_gfid(&req->loc, req->inode, piatt); \
                 inode = dfc_size_update(req, &args->xdata); \
                 if (inode != NULL) \
                 { \
@@ -2152,6 +2178,7 @@ DFC_CHECK(fxattrop)
             req->ro = _ro; \
             req->inode = _inode1; \
             sys_loc_acquire(&req->loc, _loc); \
+            dfc_fix_gfid(&req->loc, _inode1, NULL); \
             sys_fd_acquire(&req->fd, _fd); \
             req->update = dfc_managed_##_fop##_update; \
             INIT_LIST_HEAD(&req->sibling_list); \
